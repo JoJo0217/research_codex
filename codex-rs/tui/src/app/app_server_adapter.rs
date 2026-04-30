@@ -907,9 +907,10 @@ fn thread_item_to_core(item: &ThreadItem) -> Option<TurnItem> {
             result: result.clone(),
             saved_path: saved_path.clone(),
         })),
-        ThreadItem::ContextCompaction { id } => {
+        ThreadItem::ContextCompaction { id, summary } => {
             Some(TurnItem::ContextCompaction(ContextCompactionItem {
                 id: id.clone(),
+                summary: summary.clone(),
             }))
         }
         ThreadItem::CommandExecution { .. }
@@ -1616,6 +1617,7 @@ mod tests {
                     },
                     ThreadItem::ContextCompaction {
                         id: "compact-1".to_string(),
+                        summary: Some("compact summary".to_string()),
                     },
                 ],
                 status: TurnStatus::Completed,

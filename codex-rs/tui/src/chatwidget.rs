@@ -5003,11 +5003,10 @@ impl ChatWidget {
                 self.status_line_branch_lookup_complete = false;
                 self.refresh_status_surfaces();
                 if let Some(thread_id) = self.thread_id {
-                    self.app_event_tx
-                        .send(AppEvent::RuntimeCwdChanged {
-                            thread_id,
-                            cwd: ev.cwd.clone(),
-                        });
+                    self.app_event_tx.send(AppEvent::RuntimeCwdChanged {
+                        thread_id,
+                        cwd: ev.cwd.clone(),
+                    });
                 }
             }
             self.maybe_send_next_queued_input();
@@ -6610,8 +6609,7 @@ impl ChatWidget {
                     };
                     if from_replay {
                         self.handle_exec_end_now_with_runtime_cwd_sync(
-                            event,
-                            /*sync_runtime_cwd*/ false,
+                            event, /*sync_runtime_cwd*/ false,
                         );
                     } else {
                         self.on_exec_command_end(event);
@@ -6727,9 +6725,7 @@ impl ChatWidget {
             ThreadItem::ExitedReviewMode { .. } => {
                 self.exit_review_mode_after_item();
             }
-            ThreadItem::ContextCompaction { .. } => {
-                self.add_info_message("Context compacted".to_string(), /*hint*/ None);
-            }
+            ThreadItem::ContextCompaction { .. } => self.on_context_compacted(None),
             ThreadItem::HookPrompt { .. } => {}
             ThreadItem::CollabAgentToolCall {
                 id,
@@ -7585,8 +7581,7 @@ impl ChatWidget {
             EventMsg::ExecCommandEnd(ev) => {
                 if from_replay {
                     self.handle_exec_end_now_with_runtime_cwd_sync(
-                        ev,
-                        /*sync_runtime_cwd*/ false,
+                        ev, /*sync_runtime_cwd*/ false,
                     );
                 } else {
                     self.on_exec_command_end(ev);
@@ -7631,7 +7626,7 @@ impl ChatWidget {
                 self.on_entered_review_mode(review_request, from_replay)
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
-            EventMsg::ContextCompacted(_) => {}
+            EventMsg::ContextCompacted(ev) => self.on_context_compacted(ev.summary),
             EventMsg::CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent {
                 call_id,
                 model,
@@ -7708,8 +7703,14 @@ impl ChatWidget {
                 if let codex_protocol::items::TurnItem::Plan(plan_item) = &item {
                     self.on_plan_item_completed(plan_item.text.clone());
                 }
-                if let codex_protocol::items::TurnItem::AgentMessage(item) = item {
-                    self.on_agent_message_item_completed(item);
+                match item {
+                    codex_protocol::items::TurnItem::AgentMessage(item) => {
+                        self.on_agent_message_item_completed(item);
+                    }
+                    codex_protocol::items::TurnItem::ContextCompaction(item) => {
+                        self.on_context_compacted(item.summary);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -10995,6 +10996,13 @@ impl ChatWidget {
     pub(crate) fn add_info_message(&mut self, message: String, hint: Option<String>) {
         self.add_to_history(history_cell::new_info_event(message, hint));
         self.request_redraw();
+    }
+
+    fn on_context_compacted(&mut self, summary: Option<String>) {
+        self.app_event_tx
+            .send(AppEvent::ReplaceTranscriptWithCompactionSummary(Box::new(
+                history_cell::new_context_compaction_summary(summary, &self.config.cwd),
+            )));
     }
 
     pub(crate) fn add_memories_enable_notice(&mut self) {

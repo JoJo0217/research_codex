@@ -154,9 +154,12 @@ async fn run_compact_task_inner_impl(
     input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
 ) -> CodexResult<()> {
-    let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
-    sess.emit_turn_item_started(&turn_context, &compaction_item)
-        .await;
+    let mut compaction_item = ContextCompactionItem::new();
+    sess.emit_turn_item_started(
+        &turn_context,
+        &TurnItem::ContextCompaction(compaction_item.clone()),
+    )
+    .await;
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
 
     let mut history = sess.clone_history().await;
@@ -278,7 +281,8 @@ async fn run_compact_task_inner_impl(
     client_session.reset_websocket_session();
     sess.recompute_token_usage(&turn_context).await;
 
-    sess.emit_turn_item_completed(&turn_context, compaction_item)
+    compaction_item.summary = Some(summary_text);
+    sess.emit_turn_item_completed(&turn_context, TurnItem::ContextCompaction(compaction_item))
         .await;
     let warning = EventMsg::Warning(WarningEvent {
         message: "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.".to_string(),

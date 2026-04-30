@@ -2467,7 +2467,7 @@ trust_level = "untrusted"
         let rollout_path = temp_dir.path().join("rollout.jsonl");
         let rollout_line = RolloutLine {
             timestamp: "t0".to_string(),
-            item: RolloutItem::TurnContext(build_turn_context(&config, rollout_cwd)),
+            item: RolloutItem::TurnContext(build_turn_context(&config, rollout_cwd.clone())),
         };
         std::fs::write(
             &rollout_path,

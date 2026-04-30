@@ -430,6 +430,9 @@ pub(crate) enum AppEvent {
     BeginInitialHistoryReplayBuffer,
 
     InsertHistoryCell(Box<dyn HistoryCell>),
+    /// Replace visible transcript history after context compaction installs a
+    /// compacted model context.
+    ReplaceTranscriptWithCompactionSummary(Box<dyn HistoryCell>),
 
     /// Finish buffering initial resume replay after all replay events have been queued.
     EndInitialHistoryReplayBuffer,

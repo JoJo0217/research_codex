@@ -203,6 +203,23 @@ impl App {
                     );
                 }
             }
+            AppEvent::ReplaceTranscriptWithCompactionSummary(cell) => {
+                let cell: Arc<dyn HistoryCell> = cell.into();
+                self.clear_terminal_ui(tui, /*redraw_header*/ true)?;
+                self.transcript_cells.clear();
+                self.transcript_cells.push(cell.clone());
+                self.transcript_reflow.clear();
+                self.backtrack = BacktrackState::default();
+                if let Some(Overlay::Transcript(t)) = &mut self.overlay {
+                    t.replace_cells(self.transcript_cells.clone());
+                    tui.frame_requester().schedule_frame();
+                }
+                self.insert_history_cell_lines(
+                    tui,
+                    cell.as_ref(),
+                    tui.terminal.last_known_screen_size.width,
+                );
+            }
             AppEvent::EndInitialHistoryReplayBuffer => {
                 self.finish_initial_history_replay_buffer(tui);
             }

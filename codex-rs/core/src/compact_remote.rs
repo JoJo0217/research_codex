@@ -124,7 +124,7 @@ async fn run_remote_compact_task_inner_impl(
         turn_context.model_info.slug.as_str(),
         turn_context.provider.info().name.as_str(),
     );
-    let compaction_item = TurnItem::ContextCompaction(context_compaction_item);
+    let compaction_item = TurnItem::ContextCompaction(context_compaction_item.clone());
     sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
     let mut history = sess.clone_history().await;

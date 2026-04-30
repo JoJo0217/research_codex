@@ -2356,6 +2356,55 @@ pub(crate) fn new_info_event(message: String, hint: Option<String>) -> PlainHist
     PlainHistoryCell { lines }
 }
 
+#[derive(Debug)]
+pub(crate) struct ContextCompactionSummaryCell {
+    summary: Option<String>,
+    cwd: PathBuf,
+}
+
+pub(crate) fn new_context_compaction_summary(
+    summary: Option<String>,
+    cwd: &Path,
+) -> ContextCompactionSummaryCell {
+    ContextCompactionSummaryCell {
+        summary,
+        cwd: cwd.to_path_buf(),
+    }
+}
+
+impl HistoryCell for ContextCompactionSummaryCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines: Vec<Line<'static>> = vec![
+            vec![
+                "• ".dim(),
+                "Context compacted".bold(),
+                " - transcript now matches the active model context.".dim(),
+            ]
+            .into(),
+        ];
+
+        let Some(summary) = self
+            .summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return lines;
+        };
+
+        lines.push(Line::from(""));
+        let mut body = Vec::new();
+        append_markdown(
+            summary,
+            crate::width::usable_content_width_u16(width, /*reserved_cols*/ 2),
+            Some(self.cwd.as_path()),
+            &mut body,
+        );
+        lines.extend(prefix_lines(body, "  ".into(), "  ".into()));
+        lines
+    }
+}
+
 pub(crate) fn new_error_event(message: String) -> PlainHistoryCell {
     // Use a hair space (U+200A) to create a subtle, near-invisible separation
     // before the text. VS16 is intentionally omitted to keep spacing tighter
@@ -3181,6 +3230,19 @@ mod tests {
                 expected_saved_path,
             ],
         );
+    }
+
+    #[test]
+    fn context_compaction_summary_renders_active_context_summary() {
+        let cell = new_context_compaction_summary(
+            Some("Summary line\n\n- important state".to_string()),
+            Path::new("/tmp"),
+        );
+        let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+
+        assert!(rendered.contains("Context compacted"));
+        assert!(rendered.contains("Summary line"));
+        assert!(rendered.contains("important state"));
     }
 
     fn session_configured_event(model: &str) -> SessionConfiguredEvent {
