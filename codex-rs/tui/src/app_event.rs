@@ -31,6 +31,7 @@ use codex_protocol::protocol::RateLimitSnapshot;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_approval_presets::ApprovalPreset;
 
+use crate::app_backtrack::BacktrackSelection;
 use crate::app_command::AppCommand;
 use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::StatusLineItem;
@@ -139,6 +140,12 @@ pub(crate) enum AppEvent {
     RuntimeCwdChanged {
         thread_id: ThreadId,
         cwd: AbsolutePathBuf,
+    },
+
+    /// Confirm a backtrack selection after the user chose whether to restore files.
+    ApplyBacktrackSelection {
+        selection: BacktrackSelection,
+        restore_code: bool,
     },
 
     /// Deliver a synthetic history lookup response to a specific thread channel.

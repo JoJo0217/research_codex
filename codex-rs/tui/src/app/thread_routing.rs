@@ -10,7 +10,7 @@ impl App {
     pub(super) async fn shutdown_current_thread(&mut self, app_server: &mut AppServerSession) {
         if let Some(thread_id) = self.chat_widget.thread_id() {
             // Clear any in-flight rollback guard when switching threads.
-            self.backtrack.pending_rollback = None;
+            self.discard_pending_backtrack_rollback();
             if let Err(err) = app_server.thread_unsubscribe(thread_id).await {
                 tracing::warn!("failed to unsubscribe thread {thread_id}: {err}");
             }

@@ -4415,7 +4415,7 @@ async fn backtrack_selection_with_duplicate_history_targets_unique_turn() {
         vec!["https://example.com/backtrack.png".to_string()]
     );
 
-    app.apply_backtrack_rollback(selection);
+    app.apply_backtrack_rollback(selection, None);
     assert_eq!(
         app.chat_widget.remote_image_urls(),
         vec!["https://example.com/backtrack.png".to_string()]
@@ -4445,13 +4445,16 @@ async fn backtrack_remote_image_only_selection_clears_existing_composer_draft() 
         .set_composer_text("stale draft".to_string(), Vec::new(), Vec::new());
 
     let remote_image_url = "https://example.com/remote-only.png".to_string();
-    app.apply_backtrack_rollback(BacktrackSelection {
-        nth_user_message: 0,
-        prefill: String::new(),
-        text_elements: Vec::new(),
-        local_image_paths: Vec::new(),
-        remote_image_urls: vec![remote_image_url.clone()],
-    });
+    app.apply_backtrack_rollback(
+        BacktrackSelection {
+            nth_user_message: 0,
+            prefill: String::new(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: vec![remote_image_url.clone()],
+        },
+        None,
+    );
 
     assert_eq!(app.chat_widget.composer_text_with_pending(), "");
     assert_eq!(app.chat_widget.remote_image_urls(), vec![remote_image_url]);
@@ -4501,13 +4504,16 @@ async fn backtrack_resubmit_preserves_data_image_urls_in_user_turn() {
         remote_image_urls: vec![data_image_url.clone()],
     }) as Arc<dyn HistoryCell>];
 
-    app.apply_backtrack_rollback(BacktrackSelection {
-        nth_user_message: 0,
-        prefill: "please inspect this".to_string(),
-        text_elements: Vec::new(),
-        local_image_paths: Vec::new(),
-        remote_image_urls: vec![data_image_url.clone()],
-    });
+    app.apply_backtrack_rollback(
+        BacktrackSelection {
+            nth_user_message: 0,
+            prefill: "please inspect this".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: vec![data_image_url.clone()],
+        },
+        None,
+    );
 
     app.chat_widget
         .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));

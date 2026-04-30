@@ -93,7 +93,7 @@ impl App {
         self.has_emitted_history_lines = false;
         self.transcript_reflow.clear();
         self.initial_history_replay_buffer = None;
-        self.backtrack = BacktrackState::default();
+        self.reset_backtrack_state_and_pending_restore();
         self.backtrack_render_pending = false;
     }
 }

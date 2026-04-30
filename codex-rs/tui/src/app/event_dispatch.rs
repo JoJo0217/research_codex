@@ -209,7 +209,7 @@ impl App {
                 self.transcript_cells.clear();
                 self.transcript_cells.push(cell.clone());
                 self.transcript_reflow.clear();
-                self.backtrack = BacktrackState::default();
+                self.reset_backtrack_state_and_pending_restore();
                 if let Some(Overlay::Transcript(t)) = &mut self.overlay {
                     t.replace_cells(self.transcript_cells.clone());
                     tui.frame_requester().schedule_frame();
@@ -288,6 +288,12 @@ impl App {
                 if self.apply_non_pending_thread_rollback(num_turns) {
                     tui.frame_requester().schedule_frame();
                 }
+            }
+            AppEvent::ApplyBacktrackSelection {
+                selection,
+                restore_code,
+            } => {
+                self.apply_backtrack_selection_with_restore_mode(tui, selection, restore_code);
             }
             AppEvent::StartCommitAnimation => {
                 if self

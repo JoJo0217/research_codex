@@ -265,6 +265,7 @@ macro_rules! assert_chatwidget_snapshot {
 mod app_server;
 mod approval_requests;
 mod background_events;
+mod backtrack_file_restore;
 mod composer_submission;
 mod exec_flow;
 mod goal_menu;

@@ -31,6 +31,7 @@ use std::sync::Arc;
 use crate::app::App;
 use crate::app_command::AppCommand;
 use crate::app_event::AppEvent;
+use crate::chatwidget::AppliedBacktrackFileRestore;
 #[cfg(test)]
 use crate::history_cell::AgentMessageCell;
 use crate::history_cell::SessionInfoCell;
@@ -99,6 +100,7 @@ pub(crate) struct BacktrackSelection {
 pub(crate) struct PendingBacktrackRollback {
     pub(crate) selection: BacktrackSelection,
     pub(crate) thread_id: Option<ThreadId>,
+    pub(crate) file_restore: Option<AppliedBacktrackFileRestore>,
 }
 
 impl App {
@@ -189,13 +191,23 @@ impl App {
     ///
     /// The composer prefill is applied immediately as a UX convenience; it does not imply that
     /// core has accepted the rollback.
-    pub(crate) fn apply_backtrack_rollback(&mut self, selection: BacktrackSelection) {
+    pub(crate) fn apply_backtrack_rollback(
+        &mut self,
+        selection: BacktrackSelection,
+        file_restore: Option<AppliedBacktrackFileRestore>,
+    ) {
         let user_total = user_count(&self.transcript_cells);
         if user_total == 0 {
+            if let Some(file_restore) = file_restore {
+                let _ = self.chat_widget.undo_backtrack_file_restore(file_restore);
+            }
             return;
         }
 
         if self.backtrack.pending_rollback.is_some() {
+            if let Some(file_restore) = file_restore {
+                let _ = self.chat_widget.undo_backtrack_file_restore(file_restore);
+            }
             self.chat_widget
                 .add_error_message("Backtrack rollback already in progress.".to_string());
             return;
@@ -204,6 +216,9 @@ impl App {
         let num_turns = user_total.saturating_sub(selection.nth_user_message);
         let num_turns = u32::try_from(num_turns).unwrap_or(u32::MAX);
         if num_turns == 0 {
+            if let Some(file_restore) = file_restore {
+                let _ = self.chat_widget.undo_backtrack_file_restore(file_restore);
+            }
             return;
         }
 
@@ -215,9 +230,21 @@ impl App {
         self.backtrack.pending_rollback = Some(PendingBacktrackRollback {
             selection,
             thread_id: self.chat_widget.thread_id(),
+            file_restore,
         });
-        self.chat_widget
-            .submit_op(AppCommand::thread_rollback(num_turns));
+        if !self
+            .chat_widget
+            .submit_op(AppCommand::thread_rollback(num_turns))
+        {
+            if let Some(pending) = self.backtrack.pending_rollback.take()
+                && let Some(file_restore) = pending.file_restore
+            {
+                let _ = self.chat_widget.undo_backtrack_file_restore(file_restore);
+            }
+            self.chat_widget
+                .add_error_message("Failed to submit backtrack rollback.".to_string());
+            return;
+        }
         self.chat_widget.set_remote_image_urls(remote_image_urls);
         if !prefill.is_empty()
             || !text_elements.is_empty()
@@ -429,8 +456,7 @@ impl App {
         let selection = self.backtrack_selection(nth_user_message);
         self.close_transcript_overlay(tui);
         if let Some(selection) = selection {
-            self.apply_backtrack_rollback(selection);
-            tui.frame_requester().schedule_frame();
+            self.apply_backtrack_selection(tui, selection);
         }
     }
 
@@ -480,7 +506,43 @@ impl App {
         tui: &mut tui::Tui,
         selection: BacktrackSelection,
     ) {
-        self.apply_backtrack_rollback(selection);
+        if self
+            .chat_widget
+            .has_backtrack_file_snapshots_after(selection.nth_user_message)
+        {
+            self.chat_widget.open_backtrack_restore_prompt(selection);
+        } else {
+            self.apply_backtrack_selection_with_restore_mode(
+                tui, selection, /*restore_code*/ false,
+            );
+        }
+        tui.frame_requester().schedule_frame();
+    }
+
+    pub(crate) fn apply_backtrack_selection_with_restore_mode(
+        &mut self,
+        tui: &mut tui::Tui,
+        selection: BacktrackSelection,
+        restore_code: bool,
+    ) {
+        let file_restore = if restore_code {
+            match self
+                .chat_widget
+                .restore_files_for_backtrack(selection.nth_user_message)
+            {
+                Ok(restore) => Some(restore),
+                Err(error) => {
+                    self.chat_widget
+                        .add_error_message(format!("Backtrack file restore failed: {error}"));
+                    tui.frame_requester().schedule_frame();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        self.apply_backtrack_rollback(selection, file_restore);
         tui.frame_requester().schedule_frame();
     }
 
@@ -494,7 +556,22 @@ impl App {
     }
 
     pub(crate) fn handle_backtrack_rollback_failed(&mut self) {
-        self.backtrack.pending_rollback = None;
+        self.discard_pending_backtrack_rollback();
+    }
+
+    pub(crate) fn discard_pending_backtrack_rollback(&mut self) {
+        if let Some(pending) = self.backtrack.pending_rollback.take()
+            && let Some(file_restore) = pending.file_restore
+        {
+            let _ = self.chat_widget.undo_backtrack_file_restore(file_restore);
+        }
+    }
+
+    pub(crate) fn reset_backtrack_state_and_pending_restore(&mut self) {
+        self.discard_pending_backtrack_rollback();
+        self.backtrack = BacktrackState::default();
+        self.chat_widget.reset_backtrack_file_restore_tracking();
+        self.chat_widget.clear_esc_backtrack_hint();
     }
 
     /// Apply rollback semantics for `ThreadRolledBack` events where this TUI does not have an
@@ -507,6 +584,10 @@ impl App {
         }
         self.chat_widget
             .truncate_agent_copy_history_to_user_turn_count(user_count(&self.transcript_cells));
+        self.chat_widget
+            .truncate_backtrack_file_snapshots_to_user_turn_count(user_count(
+                &self.transcript_cells,
+            ));
         self.sync_overlay_after_transcript_trim();
         self.backtrack_render_pending = true;
         true
@@ -522,16 +603,24 @@ impl App {
         };
         if pending.thread_id != self.chat_widget.thread_id() {
             // Ignore rollbacks targeting a prior thread.
+            if let Some(file_restore) = pending.file_restore {
+                let _ = self.chat_widget.undo_backtrack_file_restore(file_restore);
+            }
             return;
         }
         if trim_transcript_cells_to_nth_user(
             &mut self.transcript_cells,
             pending.selection.nth_user_message,
         ) {
+            let retained_user_count = user_count(&self.transcript_cells);
             self.chat_widget
-                .truncate_agent_copy_history_to_user_turn_count(user_count(&self.transcript_cells));
+                .truncate_agent_copy_history_to_user_turn_count(retained_user_count);
+            self.chat_widget
+                .truncate_backtrack_file_snapshots_to_user_turn_count(retained_user_count);
             self.sync_overlay_after_transcript_trim();
             self.backtrack_render_pending = true;
+        } else if let Some(file_restore) = pending.file_restore {
+            let _ = self.chat_widget.undo_backtrack_file_restore(file_restore);
         }
     }
 

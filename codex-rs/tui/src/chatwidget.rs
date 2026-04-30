@@ -44,6 +44,7 @@ use std::time::Instant;
 
 use self::realtime::PendingSteerCompareKey;
 use crate::app::app_server_requests::ResolvedAppServerRequest;
+use crate::app_backtrack::BacktrackSelection;
 use crate::app_command::AppCommand;
 use crate::app_event::RealtimeAudioDeviceKind;
 use crate::app_server_approval_conversions::file_update_changes_to_core;
@@ -180,6 +181,7 @@ use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::ExecCommandStatus;
 #[cfg(test)]
 use codex_protocol::protocol::ExitedReviewModeEvent;
+use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::GuardianAssessmentAction;
 use codex_protocol::protocol::GuardianAssessmentDecisionSource;
 use codex_protocol::protocol::GuardianAssessmentEvent;
@@ -196,6 +198,7 @@ use codex_protocol::protocol::McpToolCallEndEvent;
 use codex_protocol::protocol::ModelVerification as CoreModelVerification;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::PatchApplyBeginEvent;
+use codex_protocol::protocol::PatchApplyStatus;
 use codex_protocol::protocol::RateLimitReachedType;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::ReviewRequest;
@@ -506,6 +509,170 @@ const MAX_AGENT_COPY_HISTORY: usize = 32;
 struct AgentTurnMarkdown {
     user_turn_count: usize,
     markdown: String,
+}
+
+#[derive(Clone, Debug)]
+struct FileSnapshot {
+    path: PathBuf,
+    before: Option<FileSnapshotState>,
+}
+
+#[derive(Clone, Debug)]
+struct FileSnapshotState {
+    bytes: Vec<u8>,
+    permissions: std::fs::Permissions,
+}
+
+#[derive(Clone, Debug)]
+struct PendingPatchSnapshots {
+    user_turn_count: usize,
+    snapshots: Vec<FileSnapshot>,
+    restorable: bool,
+}
+
+#[derive(Clone, Debug)]
+struct BacktrackFileTurnSnapshot {
+    user_turn_count: usize,
+    snapshots: Vec<FileSnapshot>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AppliedBacktrackFileRestore {
+    snapshots: Vec<FileSnapshot>,
+}
+
+fn snapshot_file(path: &Path) -> std::io::Result<Option<FileSnapshotState>> {
+    reject_symlinked_existing_ancestors(path)?;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err(std::io::Error::other(format!(
+                "cannot snapshot non-regular file {}",
+                path.display()
+            )))
+        }
+        Ok(metadata) => Ok(Some(FileSnapshotState {
+            bytes: std::fs::read(path)?,
+            permissions: metadata.permissions(),
+        })),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn restore_file_snapshots(snapshots: &[FileSnapshot]) -> std::io::Result<()> {
+    for snapshot in snapshots {
+        restore_file_snapshot(snapshot)?;
+    }
+    Ok(())
+}
+
+fn reject_symlinked_existing_ancestors(path: &Path) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+
+    let mut current = PathBuf::new();
+    for component in parent.components() {
+        current.push(component.as_os_str());
+        if current.as_os_str().is_empty() {
+            continue;
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::other(format!(
+                    "refusing to access path below symlinked directory {}",
+                    current.display()
+                )));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(std::io::Error::other(format!(
+                    "refusing to access path below non-directory {}",
+                    current.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn write_regular_file_no_follow(path: &Path, state: &FileSnapshotState) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(&state.bytes)?;
+        file.set_permissions(state.permissions.clone())?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, &state.bytes)?;
+        std::fs::set_permissions(path, state.permissions.clone())
+    }
+}
+
+fn restore_file_snapshot(snapshot: &FileSnapshot) -> std::io::Result<()> {
+    reject_symlinked_existing_ancestors(&snapshot.path)?;
+    if let Some(state) = &snapshot.before {
+        match std::fs::symlink_metadata(&snapshot.path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(std::io::Error::other(format!(
+                    "refusing to restore over non-regular file {}",
+                    snapshot.path.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if let Some(parent) = snapshot.path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_regular_file_no_follow(&snapshot.path, state)?;
+    } else {
+        match std::fs::symlink_metadata(&snapshot.path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
+                std::fs::remove_file(&snapshot.path)?;
+            }
+            Ok(_) => {
+                return Err(std::io::Error::other(format!(
+                    "refusing to remove non-regular file {}",
+                    snapshot.path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn file_change_snapshot_paths(path: &Path, change: &FileChange) -> Vec<PathBuf> {
+    let mut paths = vec![path.to_path_buf()];
+    if let FileChange::Update {
+        move_path: Some(move_path),
+        ..
+    } = change
+    {
+        paths.push(move_path.clone());
+    }
+    paths
 }
 
 #[derive(Default)]
@@ -850,6 +1017,10 @@ pub(crate) struct ChatWidget {
     agent_turn_markdowns: Vec<AgentTurnMarkdown>,
     /// Number of user turns currently reflected in the visible transcript.
     visible_user_turn_count: usize,
+    backtrack_file_user_turn_base: usize,
+    pending_patch_snapshots: HashMap<String, PendingPatchSnapshots>,
+    backtrack_file_snapshots: Vec<BacktrackFileTurnSnapshot>,
+    backtrack_unrestorable_file_turns: HashSet<usize>,
     /// True when rollback discarded the requested copy source because it was
     /// older than the retained copy history.
     copy_history_evicted_by_rollback: bool,
@@ -2343,6 +2514,10 @@ impl ChatWidget {
         self.last_agent_markdown = None;
         self.agent_turn_markdowns.clear();
         self.visible_user_turn_count = 0;
+        self.backtrack_file_user_turn_base = 0;
+        self.pending_patch_snapshots.clear();
+        self.backtrack_file_snapshots.clear();
+        self.backtrack_unrestorable_file_turns.clear();
         self.copy_history_evicted_by_rollback = false;
         self.saw_copy_source_this_turn = false;
         self.bottom_pane
@@ -3766,6 +3941,7 @@ impl ChatWidget {
     }
 
     fn on_apply_patch_approval_request(&mut self, _id: String, ev: ApplyPatchApprovalRequestEvent) {
+        self.mark_pending_patch_snapshots_unrestorable(&ev.call_id);
         let ev2 = ev.clone();
         self.defer_or_handle(
             |q| q.push_apply_patch_approval(ev),
@@ -4100,7 +4276,10 @@ impl ChatWidget {
         }
     }
 
-    fn on_patch_apply_begin(&mut self, event: PatchApplyBeginEvent) {
+    fn on_patch_apply_begin(&mut self, event: PatchApplyBeginEvent, capture_snapshots: bool) {
+        if capture_snapshots {
+            self.capture_pending_patch_snapshots(&event);
+        }
         self.add_to_history(history_cell::new_patch_event(
             event.changes,
             &self.config.cwd,
@@ -4130,12 +4309,133 @@ impl ChatWidget {
         self.request_redraw();
     }
 
-    fn on_patch_apply_end(&mut self, event: codex_protocol::protocol::PatchApplyEndEvent) {
+    fn on_patch_apply_end(
+        &mut self,
+        event: codex_protocol::protocol::PatchApplyEndEvent,
+        finish_snapshots: bool,
+    ) {
+        if finish_snapshots {
+            self.finish_pending_patch_snapshots(&event);
+        }
         let ev2 = event.clone();
         self.defer_or_handle(
             |q| q.push_patch_end(event),
             |s| s.handle_patch_apply_end_now(ev2),
         );
+    }
+
+    fn capture_pending_patch_snapshots(&mut self, event: &PatchApplyBeginEvent) {
+        if self
+            .pending_patch_snapshots
+            .get(&event.call_id)
+            .is_some_and(|pending| !pending.restorable)
+        {
+            return;
+        }
+
+        if !event.auto_approved {
+            self.pending_patch_snapshots.insert(
+                event.call_id.clone(),
+                PendingPatchSnapshots {
+                    user_turn_count: self.current_backtrack_file_user_turn_count(),
+                    snapshots: Vec::new(),
+                    restorable: false,
+                },
+            );
+            return;
+        }
+
+        let mut snapshots = Vec::new();
+        let mut paths = HashSet::new();
+        let mut restorable = true;
+        for (path, change) in &event.changes {
+            for path in file_change_snapshot_paths(path, change) {
+                if paths.insert(path.clone()) {
+                    match snapshot_file(&path) {
+                        Ok(before) => snapshots.push(FileSnapshot { path, before }),
+                        Err(error) => {
+                            warn!("failed to snapshot apply_patch target: {error}");
+                            restorable = false;
+                        }
+                    }
+                }
+            }
+        }
+        self.pending_patch_snapshots.insert(
+            event.call_id.clone(),
+            PendingPatchSnapshots {
+                user_turn_count: self.current_backtrack_file_user_turn_count(),
+                snapshots,
+                restorable,
+            },
+        );
+    }
+
+    fn mark_pending_patch_snapshots_unrestorable(&mut self, call_id: &str) {
+        let user_turn_count = self.current_backtrack_file_user_turn_count();
+        let pending = self
+            .pending_patch_snapshots
+            .entry(call_id.to_string())
+            .or_insert_with(|| PendingPatchSnapshots {
+                user_turn_count,
+                snapshots: Vec::new(),
+                restorable: false,
+            });
+        pending.snapshots.clear();
+        pending.restorable = false;
+    }
+
+    fn finish_pending_patch_snapshots(
+        &mut self,
+        event: &codex_protocol::protocol::PatchApplyEndEvent,
+    ) {
+        let Some(pending) = self.pending_patch_snapshots.remove(&event.call_id) else {
+            return;
+        };
+        if event.status == PatchApplyStatus::Declined {
+            return;
+        }
+        let completed = event.success && event.status == PatchApplyStatus::Completed;
+        if !pending.restorable {
+            self.backtrack_unrestorable_file_turns
+                .insert(pending.user_turn_count);
+            return;
+        }
+        if !completed {
+            if !pending.snapshots.is_empty() {
+                self.backtrack_unrestorable_file_turns
+                    .insert(pending.user_turn_count);
+            }
+            return;
+        }
+        if pending.user_turn_count == 0 || pending.snapshots.is_empty() {
+            return;
+        }
+        self.append_backtrack_file_snapshots(pending);
+    }
+
+    fn append_backtrack_file_snapshots(&mut self, pending: PendingPatchSnapshots) {
+        if let Some(entry) = self
+            .backtrack_file_snapshots
+            .iter_mut()
+            .find(|entry| entry.user_turn_count == pending.user_turn_count)
+        {
+            for snapshot in pending.snapshots {
+                if !entry
+                    .snapshots
+                    .iter()
+                    .any(|existing| existing.path == snapshot.path)
+                {
+                    entry.snapshots.push(snapshot);
+                }
+            }
+        } else {
+            self.backtrack_file_snapshots
+                .push(BacktrackFileTurnSnapshot {
+                    user_turn_count: pending.user_turn_count,
+                    snapshots: pending.snapshots,
+                });
+        }
     }
 
     fn on_exec_command_end(&mut self, ev: ExecCommandEndEvent) {
@@ -5379,6 +5679,10 @@ impl ChatWidget {
             last_agent_markdown: None,
             agent_turn_markdowns: Vec::new(),
             visible_user_turn_count: 0,
+            backtrack_file_user_turn_base: 0,
+            pending_patch_snapshots: HashMap::new(),
+            backtrack_file_snapshots: Vec::new(),
+            backtrack_unrestorable_file_turns: HashSet::new(),
             copy_history_evicted_by_rollback: false,
             latest_proposed_plan_markdown: None,
             saw_copy_source_this_turn: false,
@@ -5819,6 +6123,157 @@ impl ChatWidget {
         self.copy_history_evicted_by_rollback =
             had_copy_history && self.last_agent_markdown.is_none();
         self.saw_copy_source_this_turn = false;
+    }
+
+    fn current_backtrack_file_user_turn_count(&self) -> usize {
+        self.visible_user_turn_count
+            .saturating_sub(self.backtrack_file_user_turn_base)
+    }
+
+    pub(crate) fn reset_backtrack_file_restore_tracking(&mut self) {
+        self.backtrack_file_user_turn_base = self.visible_user_turn_count;
+        self.pending_patch_snapshots.clear();
+        self.backtrack_file_snapshots.clear();
+        self.backtrack_unrestorable_file_turns.clear();
+    }
+
+    pub(crate) fn has_backtrack_file_snapshots_after(&self, nth_user_message: usize) -> bool {
+        let first_removed_turn = nth_user_message.saturating_add(1);
+        let range_is_restorable = !self
+            .backtrack_unrestorable_file_turns
+            .iter()
+            .any(|turn| *turn >= first_removed_turn);
+        range_is_restorable
+            && self
+                .backtrack_file_snapshots
+                .iter()
+                .any(|entry| entry.user_turn_count >= first_removed_turn)
+    }
+
+    pub(crate) fn truncate_backtrack_file_snapshots_to_user_turn_count(
+        &mut self,
+        user_turn_count: usize,
+    ) {
+        self.backtrack_file_user_turn_base = 0;
+        self.pending_patch_snapshots.clear();
+        self.backtrack_file_snapshots
+            .retain(|entry| entry.user_turn_count <= user_turn_count);
+        self.backtrack_unrestorable_file_turns
+            .retain(|turn| *turn <= user_turn_count);
+    }
+
+    pub(crate) fn open_backtrack_restore_prompt(&mut self, selection: BacktrackSelection) {
+        let restore_selection = selection.clone();
+        let restore_actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+            tx.send(AppEvent::ApplyBacktrackSelection {
+                selection: restore_selection.clone(),
+                restore_code: true,
+            });
+        })];
+        let conversation_selection = selection;
+        let conversation_actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+            tx.send(AppEvent::ApplyBacktrackSelection {
+                selection: conversation_selection.clone(),
+                restore_code: false,
+            });
+        })];
+
+        let mut header = ColumnRenderable::new();
+        header.push(Line::from("Restore edited files too?".bold()));
+        header.push(Line::from(
+            "Codex can restore files changed by apply_patch after this message.".dim(),
+        ));
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Backtrack".to_string()),
+            footer_hint: Some(standard_popup_hint_line()),
+            header: Box::new(header),
+            items: vec![
+                SelectionItem {
+                    name: "Restore code and conversation".to_string(),
+                    description: Some("Revert tracked apply_patch edits, then rewind.".to_string()),
+                    actions: restore_actions,
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+                SelectionItem {
+                    name: "Restore conversation only".to_string(),
+                    description: Some("Keep files as they are.".to_string()),
+                    actions: conversation_actions,
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+                SelectionItem {
+                    name: "Cancel".to_string(),
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+    }
+
+    pub(crate) fn restore_files_for_backtrack(
+        &mut self,
+        nth_user_message: usize,
+    ) -> std::io::Result<AppliedBacktrackFileRestore> {
+        let first_removed_turn = nth_user_message.saturating_add(1);
+        if self
+            .backtrack_unrestorable_file_turns
+            .iter()
+            .any(|turn| *turn >= first_removed_turn)
+            || self
+                .pending_patch_snapshots
+                .values()
+                .any(|pending| pending.user_turn_count >= first_removed_turn)
+        {
+            return Err(std::io::Error::other(
+                "cannot restore files while patch state is incomplete",
+            ));
+        }
+
+        let mut snapshots = Vec::new();
+        let mut seen = HashSet::new();
+        for entry in self
+            .backtrack_file_snapshots
+            .iter()
+            .filter(|entry| entry.user_turn_count >= first_removed_turn)
+        {
+            for snapshot in &entry.snapshots {
+                if seen.insert(snapshot.path.clone()) {
+                    snapshots.push(snapshot.clone());
+                }
+            }
+        }
+
+        let mut undo_snapshots = Vec::new();
+        for snapshot in &snapshots {
+            undo_snapshots.push(FileSnapshot {
+                path: snapshot.path.clone(),
+                before: snapshot_file(&snapshot.path)?,
+            });
+        }
+        let mut applied_undo_snapshots = Vec::new();
+        for (snapshot, undo_snapshot) in snapshots.iter().zip(undo_snapshots.iter()) {
+            if let Err(error) = restore_file_snapshot(snapshot) {
+                let _ = restore_file_snapshot(undo_snapshot);
+                for undo_snapshot in applied_undo_snapshots.iter().rev() {
+                    let _ = restore_file_snapshot(undo_snapshot);
+                }
+                return Err(error);
+            }
+            applied_undo_snapshots.push(undo_snapshot.clone());
+        }
+        Ok(AppliedBacktrackFileRestore {
+            snapshots: undo_snapshots,
+        })
+    }
+
+    pub(crate) fn undo_backtrack_file_restore(
+        &mut self,
+        restore: AppliedBacktrackFileRestore,
+    ) -> std::io::Result<()> {
+        restore_file_snapshots(&restore.snapshots)
     }
 
     /// Inner implementation with an injectable clipboard backend for testing.
@@ -6625,31 +7080,34 @@ impl ChatWidget {
                     status,
                     codex_app_server_protocol::PatchApplyStatus::InProgress
                 ) {
-                    self.on_patch_apply_end(codex_protocol::protocol::PatchApplyEndEvent {
-                        call_id: id,
-                        turn_id: turn_id.clone(),
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        success: !matches!(
-                            status,
-                            codex_app_server_protocol::PatchApplyStatus::Failed
-                        ),
-                        changes: file_update_changes_to_core(changes),
-                        status: match status {
-                            codex_app_server_protocol::PatchApplyStatus::Completed => {
-                                codex_protocol::protocol::PatchApplyStatus::Completed
-                            }
-                            codex_app_server_protocol::PatchApplyStatus::Failed => {
-                                codex_protocol::protocol::PatchApplyStatus::Failed
-                            }
-                            codex_app_server_protocol::PatchApplyStatus::Declined => {
-                                codex_protocol::protocol::PatchApplyStatus::Declined
-                            }
-                            codex_app_server_protocol::PatchApplyStatus::InProgress => {
-                                codex_protocol::protocol::PatchApplyStatus::Failed
-                            }
+                    self.on_patch_apply_end(
+                        codex_protocol::protocol::PatchApplyEndEvent {
+                            call_id: id,
+                            turn_id: turn_id.clone(),
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            success: !matches!(
+                                status,
+                                codex_app_server_protocol::PatchApplyStatus::Failed
+                            ),
+                            changes: file_update_changes_to_core(changes),
+                            status: match status {
+                                codex_app_server_protocol::PatchApplyStatus::Completed => {
+                                    codex_protocol::protocol::PatchApplyStatus::Completed
+                                }
+                                codex_app_server_protocol::PatchApplyStatus::Failed => {
+                                    codex_protocol::protocol::PatchApplyStatus::Failed
+                                }
+                                codex_app_server_protocol::PatchApplyStatus::Declined => {
+                                    codex_protocol::protocol::PatchApplyStatus::Declined
+                                }
+                                codex_app_server_protocol::PatchApplyStatus::InProgress => {
+                                    codex_protocol::protocol::PatchApplyStatus::Failed
+                                }
+                            },
                         },
-                    });
+                        !from_replay,
+                    );
                 }
             }
             ThreadItem::McpToolCall {
@@ -7192,12 +7650,15 @@ impl ChatWidget {
                 });
             }
             ThreadItem::FileChange { id, changes, .. } => {
-                self.on_patch_apply_begin(PatchApplyBeginEvent {
-                    call_id: id,
-                    turn_id: notification.turn_id,
-                    auto_approved: false,
-                    changes: file_update_changes_to_core(changes),
-                });
+                self.on_patch_apply_begin(
+                    PatchApplyBeginEvent {
+                        call_id: id,
+                        turn_id: notification.turn_id,
+                        auto_approved: true,
+                        changes: file_update_changes_to_core(changes),
+                    },
+                    !from_replay,
+                );
             }
             ThreadItem::McpToolCall {
                 id,
@@ -7576,8 +8037,8 @@ impl ChatWidget {
             EventMsg::ExecCommandBegin(ev) => self.on_exec_command_begin(ev),
             EventMsg::TerminalInteraction(delta) => self.on_terminal_interaction(delta),
             EventMsg::ExecCommandOutputDelta(delta) => self.on_exec_command_output_delta(delta),
-            EventMsg::PatchApplyBegin(ev) => self.on_patch_apply_begin(ev),
-            EventMsg::PatchApplyEnd(ev) => self.on_patch_apply_end(ev),
+            EventMsg::PatchApplyBegin(ev) => self.on_patch_apply_begin(ev, !from_replay),
+            EventMsg::PatchApplyEnd(ev) => self.on_patch_apply_end(ev, !from_replay),
             EventMsg::ExecCommandEnd(ev) => {
                 if from_replay {
                     self.handle_exec_end_now_with_runtime_cwd_sync(
