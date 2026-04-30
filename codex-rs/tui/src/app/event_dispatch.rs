@@ -322,6 +322,14 @@ impl App {
             AppEvent::SubmitThreadOp { thread_id, op } => {
                 self.submit_thread_op(app_server, thread_id, op).await?;
             }
+            AppEvent::RuntimeCwdChanged { thread_id, cwd } => {
+                self.sync_thread_cwd_to_cached_session(thread_id, cwd.clone())
+                    .await;
+                if self.current_displayed_thread_id() == Some(thread_id) {
+                    self.config.cwd = cwd.clone();
+                    self.file_search.update_search_dir(cwd.to_path_buf());
+                }
+            }
             AppEvent::ThreadHistoryEntryResponse { thread_id, event } => {
                 self.enqueue_thread_history_entry_response(thread_id, event)
                     .await?;
@@ -422,7 +430,13 @@ impl App {
                 let add_succeeded = result.is_ok();
                 self.chat_widget
                     .on_marketplace_add_loaded(cwd.clone(), source, result);
-                if add_succeeded && self.chat_widget.config_ref().cwd.as_path() == cwd.as_path() {
+                if add_succeeded && self.chat_widget.discovery_cwd().as_path() == cwd.as_path() {
+                    if let Err(err) = self
+                        .refresh_in_memory_config_from_disk_for_discovery_cwd(cwd.clone())
+                        .await
+                    {
+                        tracing::warn!(error = %err, "failed to refresh config after marketplace add");
+                    }
                     self.fetch_plugins_list(app_server, cwd);
                 }
             }
@@ -468,8 +482,13 @@ impl App {
                 result,
             } => {
                 let install_succeeded = result.is_ok();
-                if install_succeeded {
-                    if let Err(err) = self.refresh_in_memory_config_from_disk().await {
+                let is_current_discovery =
+                    self.chat_widget.discovery_cwd().as_path() == cwd.as_path();
+                if install_succeeded && is_current_discovery {
+                    if let Err(err) = self
+                        .refresh_in_memory_config_from_disk_for_discovery_cwd(cwd.clone())
+                        .await
+                    {
                         tracing::warn!(error = %err, "failed to refresh config after plugin install");
                     }
                     self.chat_widget.refresh_plugin_mentions();
@@ -482,8 +501,7 @@ impl App {
                     plugin_display_name,
                     result,
                 );
-                if install_succeeded && self.chat_widget.config_ref().cwd.as_path() == cwd.as_path()
-                {
+                if install_succeeded && is_current_discovery {
                     self.fetch_plugins_list(app_server, cwd.clone());
                     if should_refresh_plugin_detail {
                         self.fetch_plugin_detail(
@@ -524,8 +542,13 @@ impl App {
                 if should_apply_result {
                     self.pending_plugin_enabled_writes.remove(&plugin_id);
                     let update_succeeded = result.is_ok();
-                    if update_succeeded {
-                        if let Err(err) = self.refresh_in_memory_config_from_disk().await {
+                    let is_current_discovery =
+                        self.chat_widget.discovery_cwd().as_path() == cwd.as_path();
+                    if update_succeeded && is_current_discovery {
+                        if let Err(err) = self
+                            .refresh_in_memory_config_from_disk_for_discovery_cwd(cwd.clone())
+                            .await
+                        {
                             tracing::warn!(
                                 error = %err,
                                 "failed to refresh config after plugin toggle"
@@ -1095,8 +1118,13 @@ impl App {
                 result,
             } => {
                 let uninstall_succeeded = result.is_ok();
-                if uninstall_succeeded {
-                    if let Err(err) = self.refresh_in_memory_config_from_disk().await {
+                let is_current_discovery =
+                    self.chat_widget.discovery_cwd().as_path() == cwd.as_path();
+                if uninstall_succeeded && is_current_discovery {
+                    if let Err(err) = self
+                        .refresh_in_memory_config_from_disk_for_discovery_cwd(cwd.clone())
+                        .await
+                    {
                         tracing::warn!(
                             error = %err,
                             "failed to refresh config after plugin uninstall"
@@ -1110,16 +1138,17 @@ impl App {
                     plugin_display_name,
                     result,
                 );
-                if uninstall_succeeded
-                    && self.chat_widget.config_ref().cwd.as_path() == cwd.as_path()
-                {
+                if uninstall_succeeded && is_current_discovery {
                     self.fetch_plugins_list(app_server, cwd);
                 }
             }
             AppEvent::RefreshPluginMentions => {
                 self.refresh_plugin_mentions();
             }
-            AppEvent::PluginMentionsLoaded { mut plugins } => {
+            AppEvent::PluginMentionsLoaded { cwd, mut plugins } => {
+                if self.chat_widget.discovery_cwd().as_path() != cwd.as_path() {
+                    return Ok(AppRunControl::Continue);
+                }
                 if !self.config.features.enabled(Feature::Plugins) {
                     plugins = None;
                 }

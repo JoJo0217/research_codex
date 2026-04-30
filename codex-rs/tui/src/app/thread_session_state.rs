@@ -5,8 +5,28 @@ use codex_app_server_protocol::Thread;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::PermissionProfile;
+use codex_utils_absolute_path::AbsolutePathBuf;
 
 impl App {
+    pub(super) async fn sync_thread_cwd_to_cached_session(
+        &mut self,
+        thread_id: ThreadId,
+        cwd: AbsolutePathBuf,
+    ) {
+        if self.primary_thread_id == Some(thread_id)
+            && let Some(session) = self.primary_session_configured.as_mut()
+        {
+            session.cwd = cwd.clone();
+        }
+
+        if let Some(channel) = self.thread_event_channels.get(&thread_id) {
+            let mut store = channel.store.lock().await;
+            if let Some(session) = store.session.as_mut() {
+                session.cwd = cwd;
+            }
+        }
+    }
+
     pub(super) async fn sync_active_thread_permission_settings_to_cached_session(&mut self) {
         let Some(active_thread_id) = self.active_thread_id else {
             return;

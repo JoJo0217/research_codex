@@ -1,3 +1,5 @@
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +19,7 @@ use crate::exec::StdoutStream;
 use crate::exec::execute_exec_request;
 use crate::exec_env::create_env;
 use crate::sandboxing::ExecRequest;
+use crate::shell::ShellType;
 use crate::session::turn_context::TurnContext;
 use crate::state::TaskKind;
 use crate::tools::format_exec_output_str;
@@ -29,13 +32,16 @@ use codex_protocol::protocol::ExecCommandBeginEvent;
 use codex_protocol::protocol::ExecCommandEndEvent;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::ExecCommandStatus;
+use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_sandboxing::SandboxType;
 use codex_shell_command::parse_command::parse_command;
+use codex_utils_absolute_path::AbsolutePathBuf;
 
 use super::SessionTask;
 use super::SessionTaskContext;
 use crate::session::session::Session;
+use crate::session::session::SessionSettingsUpdate;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
@@ -155,8 +161,32 @@ pub(crate) async fn execute_user_shell_command(
     let call_id = Uuid::new_v4().to_string();
     let raw_command = command;
     let cwd = turn_context.cwd.clone();
+    let shell_home = exec_env_map
+        .get("HOME")
+        .map(|value| PathBuf::from(value.as_str()));
+    let cdpath_may_affect = exec_env_map.get("CDPATH").is_some_and(|value| !value.is_empty())
+        || shell_snapshot_exports_cdpath(session_shell.as_ref(), &turn_context.cwd);
 
     let parsed_cmd = parse_command(&display_command);
+    if matches!(
+        session_shell.shell_type,
+        ShellType::Bash | ShellType::Zsh | ShellType::Sh
+    ) && handle_cd_command(
+        &session,
+        turn_context.as_ref(),
+        &raw_command,
+        &display_command,
+        &parsed_cmd,
+        &call_id,
+        shell_home.as_deref(),
+        cdpath_may_affect,
+        mode,
+    )
+    .await
+    {
+        return;
+    }
+
     session
         .send_event(
             turn_context.as_ref(),
@@ -332,6 +362,196 @@ pub(crate) async fn execute_user_shell_command(
             .await;
         }
     }
+}
+
+async fn handle_cd_command(
+    session: &Session,
+    turn_context: &TurnContext,
+    raw_command: &str,
+    display_command: &[String],
+    parsed_cmd: &[codex_protocol::parse_command::ParsedCommand],
+    call_id: &str,
+    home: Option<&Path>,
+    cdpath_may_affect: bool,
+    mode: UserShellCommandMode,
+) -> bool {
+    let target = match codex_shell_command::cd::parse_with_home(raw_command, home) {
+        codex_shell_command::cd::ShellCd::NotCd => return false,
+        codex_shell_command::cd::ShellCd::Invalid(message) => {
+            send_cd_end(
+                session,
+                turn_context,
+                raw_command,
+                display_command,
+                parsed_cmd,
+                call_id,
+                turn_context.cwd.clone(),
+                cd_output(-1, &message),
+                mode,
+            )
+            .await;
+            return true;
+        }
+        codex_shell_command::cd::ShellCd::ChangeTo(target) => target,
+    };
+    if cdpath_may_affect && cdpath_can_affect(&target) {
+        return false;
+    }
+
+    let next_cwd = if mode == UserShellCommandMode::ActiveTurnAuxiliary {
+        Err("cd: cannot change cwd while a turn is in progress".to_string())
+    } else {
+        codex_shell_command::cd::resolve(target, turn_context.cwd.as_path())
+    };
+    let (cwd, output) = match next_cwd {
+        Ok(path) => match AbsolutePathBuf::try_from(path.clone()) {
+            Ok(abs) => match session
+                .update_settings(SessionSettingsUpdate {
+                    cwd: Some(path),
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok(()) => {
+                    let mut item = turn_context.to_turn_context_item();
+                    item.cwd = abs.to_path_buf();
+                    session.persist_rollout_items(&[RolloutItem::TurnContext(item)]).await;
+                    let output = cd_output(0, &format!("cwd: {}", abs.display()));
+                    (abs, output)
+                }
+                Err(err) => (
+                    turn_context.cwd.clone(),
+                    cd_output(-1, &format!("cd: failed to update cwd: {err}")),
+                ),
+            },
+            Err(err) => (
+                turn_context.cwd.clone(),
+                cd_output(-1, &format!("cd: resolved path is not absolute: {err}")),
+            ),
+        },
+        Err(message) => (turn_context.cwd.clone(), cd_output(-1, &message)),
+    };
+    send_cd_end(
+        session,
+        turn_context,
+        raw_command,
+        display_command,
+        parsed_cmd,
+        call_id,
+        cwd,
+        output,
+        mode,
+    )
+    .await;
+    true
+}
+
+fn cd_output(exit_code: i32, message: &str) -> ExecToolCallOutput {
+    let (stdout, stderr) = if exit_code == 0 {
+        (message.to_string(), String::new())
+    } else {
+        (String::new(), message.to_string())
+    };
+    ExecToolCallOutput {
+        exit_code,
+        stdout: StreamOutput::new(stdout.clone()),
+        stderr: StreamOutput::new(stderr.clone()),
+        aggregated_output: StreamOutput::new(if exit_code == 0 { stdout } else { stderr }),
+        duration: Duration::ZERO,
+        timed_out: false,
+    }
+}
+
+async fn send_cd_end(
+    session: &Session,
+    turn_context: &TurnContext,
+    raw_command: &str,
+    display_command: &[String],
+    parsed_cmd: &[codex_protocol::parse_command::ParsedCommand],
+    call_id: &str,
+    cwd: AbsolutePathBuf,
+    output: ExecToolCallOutput,
+    mode: UserShellCommandMode,
+) {
+    session
+        .send_event(
+            turn_context,
+            EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+                call_id: call_id.to_string(),
+                process_id: None,
+                turn_id: turn_context.sub_id.clone(),
+                command: display_command.to_vec(),
+                cwd: turn_context.cwd.clone(),
+                parsed_cmd: parsed_cmd.to_vec(),
+                source: ExecCommandSource::UserShell,
+                interaction_input: None,
+            }),
+        )
+        .await;
+    session
+        .send_event(
+            turn_context,
+            EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+                call_id: call_id.to_string(),
+                process_id: None,
+                turn_id: turn_context.sub_id.clone(),
+                command: display_command.to_vec(),
+                cwd,
+                parsed_cmd: parsed_cmd.to_vec(),
+                source: ExecCommandSource::UserShell,
+                interaction_input: None,
+                stdout: output.stdout.text.clone(),
+                stderr: output.stderr.text.clone(),
+                aggregated_output: output.aggregated_output.text.clone(),
+                exit_code: output.exit_code,
+                duration: output.duration,
+                formatted_output: format_exec_output_str(
+                    &output,
+                    turn_context.truncation_policy,
+                ),
+                status: if output.exit_code == 0 {
+                    ExecCommandStatus::Completed
+                } else {
+                    ExecCommandStatus::Failed
+                },
+            }),
+        )
+        .await;
+    persist_user_shell_output(session, turn_context, raw_command, &output, mode).await;
+}
+
+fn cdpath_can_affect(target: &Path) -> bool {
+    if target.is_absolute() {
+        return false;
+    }
+    target
+        .components()
+        .next()
+        .is_some_and(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+fn shell_snapshot_exports_cdpath(shell: &crate::shell::Shell, cwd: &AbsolutePathBuf) -> bool {
+    let Some(snapshot) = shell.shell_snapshot() else {
+        return false;
+    };
+    if !snapshot.path.exists()
+        || !crate::path_utils::paths_match_after_normalization(snapshot.cwd.as_path(), cwd)
+    {
+        return false;
+    }
+    let Ok(contents) = std::fs::read_to_string(snapshot.path.as_path()) else {
+        return true;
+    };
+    contents
+        .lines()
+        .skip_while(|line| !line.trim_start().starts_with("# exports "))
+        .skip(1)
+        .any(|line| {
+            let line = line.trim_start();
+            line.starts_with("export CDPATH=")
+                || line.starts_with("declare -x CDPATH=")
+                || line.starts_with("typeset -x CDPATH=")
+        })
 }
 
 async fn persist_user_shell_output(

@@ -177,6 +177,7 @@ use codex_protocol::protocol::ExecCommandBeginEvent;
 use codex_protocol::protocol::ExecCommandEndEvent;
 use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
 use codex_protocol::protocol::ExecCommandSource;
+use codex_protocol::protocol::ExecCommandStatus;
 #[cfg(test)]
 use codex_protocol::protocol::ExitedReviewModeEvent;
 use codex_protocol::protocol::GuardianAssessmentAction;
@@ -809,6 +810,7 @@ pub(crate) struct ChatWidget {
     /// where the overlay may briefly treat new tail content as already cached.
     active_cell_revision: u64,
     config: Config,
+    discovery_cwd: AbsolutePathBuf,
     /// Runtime value resolved by core. `config.service_tier` remains the explicit user choice.
     effective_service_tier: Option<ServiceTier>,
     /// The unmasked collaboration mode settings (always Default mode).
@@ -2364,6 +2366,7 @@ impl ChatWidget {
         self.current_rollout_path = event.rollout_path.clone();
         self.current_cwd = Some(event.cwd.to_path_buf());
         self.config.cwd = event.cwd.clone();
+        self.discovery_cwd = event.cwd.clone();
         self.effective_service_tier = event.service_tier;
         if let Err(err) = self
             .config
@@ -4857,6 +4860,14 @@ impl ChatWidget {
     /// cell. If this method treated every unknown end as "complete the active cell", the UI could
     /// merge unrelated commands and hide still-running exploring work.
     pub(crate) fn handle_exec_end_now(&mut self, ev: ExecCommandEndEvent) {
+        self.handle_exec_end_now_with_runtime_cwd_sync(ev, true);
+    }
+
+    fn handle_exec_end_now_with_runtime_cwd_sync(
+        &mut self,
+        ev: ExecCommandEndEvent,
+        sync_runtime_cwd: bool,
+    ) {
         enum ExecEndTarget {
             // Normal case: the active exec cell already tracks this call id.
             ActiveTracked,
@@ -4973,6 +4984,32 @@ impl ChatWidget {
         // Mark that actual work was done (command executed)
         self.had_work_activity = true;
         if is_user_shell {
+            let cd_command = codex_shell_command::parse_command::extract_shell_command(&ev.command)
+                .map(|(_, command)| command.to_string())
+                .unwrap_or_else(|| ev.command.join(" "));
+            if sync_runtime_cwd
+                && ev.status == ExecCommandStatus::Completed
+                && matches!(
+                    codex_shell_command::cd::parse_with_home(&cd_command, Some(Path::new("/"))),
+                    codex_shell_command::cd::ShellCd::ChangeTo(_)
+                )
+            {
+                self.current_cwd = Some(ev.cwd.to_path_buf());
+                self.config.cwd = ev.cwd.clone();
+                self.status_line_project_root_name_cache = None;
+                self.status_line_branch = None;
+                self.status_line_branch_cwd = None;
+                self.status_line_branch_pending = false;
+                self.status_line_branch_lookup_complete = false;
+                self.refresh_status_surfaces();
+                if let Some(thread_id) = self.thread_id {
+                    self.app_event_tx
+                        .send(AppEvent::RuntimeCwdChanged {
+                            thread_id,
+                            cwd: ev.cwd.clone(),
+                        });
+                }
+            }
             self.maybe_send_next_queued_input();
         }
     }
@@ -5302,6 +5339,7 @@ impl ChatWidget {
             }),
             active_cell,
             active_cell_revision: 0,
+            discovery_cwd: config.cwd.clone(),
             config,
             effective_service_tier,
             skills_all: Vec::new(),
@@ -6535,7 +6573,7 @@ impl ChatWidget {
                     });
                 } else {
                     let aggregated_output = aggregated_output.unwrap_or_default();
-                    self.on_exec_command_end(ExecCommandEndEvent {
+                    let event = ExecCommandEndEvent {
                         call_id: id,
                         process_id,
                         turn_id: turn_id.clone(),
@@ -6569,7 +6607,15 @@ impl ChatWidget {
                                 codex_protocol::protocol::ExecCommandStatus::Failed
                             }
                         },
-                    });
+                    };
+                    if from_replay {
+                        self.handle_exec_end_now_with_runtime_cwd_sync(
+                            event,
+                            /*sync_runtime_cwd*/ false,
+                        );
+                    } else {
+                        self.on_exec_command_end(event);
+                    }
                 }
             }
             ThreadItem::FileChange {
@@ -7536,7 +7582,16 @@ impl ChatWidget {
             EventMsg::ExecCommandOutputDelta(delta) => self.on_exec_command_output_delta(delta),
             EventMsg::PatchApplyBegin(ev) => self.on_patch_apply_begin(ev),
             EventMsg::PatchApplyEnd(ev) => self.on_patch_apply_end(ev),
-            EventMsg::ExecCommandEnd(ev) => self.on_exec_command_end(ev),
+            EventMsg::ExecCommandEnd(ev) => {
+                if from_replay {
+                    self.handle_exec_end_now_with_runtime_cwd_sync(
+                        ev,
+                        /*sync_runtime_cwd*/ false,
+                    );
+                } else {
+                    self.on_exec_command_end(ev);
+                }
+            }
             EventMsg::ViewImageToolCall(ev) => self.on_view_image_tool_call(ev),
             EventMsg::ImageGenerationBegin(ev) => self.on_image_generation_begin(ev),
             EventMsg::ImageGenerationEnd(ev) => self.on_image_generation_end(ev),
@@ -11512,9 +11567,13 @@ impl ChatWidget {
 
     fn refresh_skills_for_current_cwd(&mut self, force_reload: bool) {
         self.submit_op(AppCommand::list_skills(
-            vec![self.config.cwd.to_path_buf()],
+            vec![self.discovery_cwd.to_path_buf()],
             force_reload,
         ));
+    }
+
+    pub(crate) fn discovery_cwd(&self) -> &AbsolutePathBuf {
+        &self.discovery_cwd
     }
 
     /// Forward a command directly to codex.

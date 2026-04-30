@@ -70,9 +70,7 @@ fn apply_session_meta_from_item(metadata: &mut ThreadMetadata, meta_line: &Sessi
 }
 
 fn apply_turn_context(metadata: &mut ThreadMetadata, turn_ctx: &TurnContextItem) {
-    if metadata.cwd.as_os_str().is_empty() {
-        metadata.cwd = turn_ctx.cwd.clone();
-    }
+    metadata.cwd = turn_ctx.cwd.clone();
     metadata.model = Some(turn_ctx.model.clone());
     metadata.reasoning_effort = turn_ctx.effort;
     metadata.sandbox_policy = enum_to_string(&turn_ctx.sandbox_policy);
@@ -260,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_context_does_not_override_session_cwd() {
+    fn turn_context_overrides_session_cwd() {
         let mut metadata = metadata_for_test();
         metadata.cwd = PathBuf::new();
         let thread_id = metadata.id;
@@ -317,7 +315,7 @@ mod tests {
             "test-provider",
         );
 
-        assert_eq!(metadata.cwd, PathBuf::from("/child/worktree"));
+        assert_eq!(metadata.cwd, PathBuf::from("/parent/workspace"));
         assert_eq!(
             metadata.sandbox_policy,
             super::enum_to_string(&SandboxPolicy::DangerFullAccess)

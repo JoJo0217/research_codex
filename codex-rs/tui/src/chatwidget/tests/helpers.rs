@@ -182,6 +182,7 @@ pub(super) async fn make_chatwidget_manual(
         bottom_pane: bottom,
         active_cell: None,
         active_cell_revision: 0,
+        discovery_cwd: cfg.cwd.clone(),
         config: cfg,
         effective_service_tier,
         current_collaboration_mode,

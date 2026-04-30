@@ -135,6 +135,12 @@ pub(crate) enum AppEvent {
         op: AppCommand,
     },
 
+    /// Synchronize app-owned cwd services after a thread changes cwd.
+    RuntimeCwdChanged {
+        thread_id: ThreadId,
+        cwd: AbsolutePathBuf,
+    },
+
     /// Deliver a synthetic history lookup response to a specific thread channel.
     ThreadHistoryEntryResponse {
         thread_id: ThreadId,
@@ -388,6 +394,7 @@ pub(crate) enum AppEvent {
 
     /// Result of refreshing plugin mention bindings.
     PluginMentionsLoaded {
+        cwd: PathBuf,
         plugins: Option<Vec<PluginCapabilitySummary>>,
     },
 

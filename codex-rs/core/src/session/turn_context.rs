@@ -678,6 +678,10 @@ impl Session {
             .map(|turn_environment| turn_environment.cwd.clone())
             .unwrap_or_else(|| session_configuration.cwd.clone());
         let per_turn_config = Self::build_per_turn_config(&session_configuration, cwd.clone());
+        let discovery_config = Self::build_per_turn_config(
+            &session_configuration,
+            session_configuration.original_config_do_not_use.cwd.clone(),
+        );
         {
             let mcp_connection_manager = self.services.mcp_connection_manager.read().await;
             mcp_connection_manager.set_approval_policy(&session_configuration.approval_policy);
@@ -696,10 +700,10 @@ impl Session {
         let plugin_outcome = self
             .services
             .plugins_manager
-            .plugins_for_config(&per_turn_config)
+            .plugins_for_config(&discovery_config)
             .await;
         let effective_skill_roots = plugin_outcome.effective_skill_roots();
-        let skills_input = skills_load_input_from_config(&per_turn_config, effective_skill_roots);
+        let skills_input = skills_load_input_from_config(&discovery_config, effective_skill_roots);
         let fs = environment
             .as_ref()
             .map(|environment| environment.get_filesystem());

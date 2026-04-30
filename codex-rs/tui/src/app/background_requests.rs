@@ -224,10 +224,12 @@ impl App {
     }
 
     pub(super) fn refresh_plugin_mentions(&mut self) {
-        let config = self.config.clone();
+        let mut config = self.config.clone();
+        config.cwd = self.chat_widget.discovery_cwd().clone();
+        let cwd = config.cwd.to_path_buf();
         let app_event_tx = self.app_event_tx.clone();
         if !config.features.enabled(Feature::Plugins) {
-            app_event_tx.send(AppEvent::PluginMentionsLoaded { plugins: None });
+            app_event_tx.send(AppEvent::PluginMentionsLoaded { cwd, plugins: None });
             return;
         }
 
@@ -238,6 +240,7 @@ impl App {
                 .capability_summaries()
                 .to_vec();
             app_event_tx.send(AppEvent::PluginMentionsLoaded {
+                cwd,
                 plugins: Some(plugins),
             });
         });

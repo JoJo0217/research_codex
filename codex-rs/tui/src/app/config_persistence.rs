@@ -30,6 +30,19 @@ impl App {
         Ok(())
     }
 
+    pub(super) async fn refresh_in_memory_config_from_disk_for_discovery_cwd(
+        &mut self,
+        discovery_cwd: PathBuf,
+    ) -> Result<()> {
+        let runtime_cwd = self.config.cwd.clone();
+        let mut config = self.rebuild_config_for_cwd(discovery_cwd).await?;
+        self.apply_runtime_policy_overrides(&mut config);
+        config.cwd = runtime_cwd;
+        self.config = config;
+        self.chat_widget.sync_plugin_mentions_config(&self.config);
+        Ok(())
+    }
+
     pub(super) async fn refresh_in_memory_config_from_disk_best_effort(&mut self, action: &str) {
         if let Err(err) = self.refresh_in_memory_config_from_disk().await {
             tracing::warn!(

@@ -2563,10 +2563,14 @@ impl InitialHistory {
 }
 
 fn session_cwd_from_items(items: &[RolloutItem]) -> Option<PathBuf> {
-    items.iter().find_map(|item| match item {
-        RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.cwd.clone()),
-        _ => None,
-    })
+    items
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            RolloutItem::TurnContext(turn_context) => Some(turn_context.cwd.clone()),
+            RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.cwd.clone()),
+            _ => None,
+        })
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS, Default)]

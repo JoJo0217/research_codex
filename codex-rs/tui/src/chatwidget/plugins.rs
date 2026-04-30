@@ -179,7 +179,7 @@ impl ChatWidget {
             self.plugins_fetch_state.in_flight_cwd = None;
         }
 
-        if self.config.cwd.as_path() != cwd.as_path() {
+        if self.discovery_cwd().as_path() != cwd.as_path() {
             return;
         }
 
@@ -222,7 +222,7 @@ impl ChatWidget {
     }
 
     fn prefetch_plugins(&mut self) {
-        let cwd = self.config.cwd.to_path_buf();
+        let cwd = self.discovery_cwd().to_path_buf();
         if self.plugins_fetch_state.in_flight_cwd.as_deref() == Some(cwd.as_path()) {
             return;
         }
@@ -236,7 +236,7 @@ impl ChatWidget {
     }
 
     fn plugins_cache_for_current_cwd(&self) -> PluginsCacheState {
-        if self.plugins_fetch_state.cache_cwd.as_deref() == Some(self.config.cwd.as_path()) {
+        if self.plugins_fetch_state.cache_cwd.as_deref() == Some(self.discovery_cwd().as_path()) {
             self.plugins_cache.clone()
         } else {
             PluginsCacheState::Uninitialized
@@ -266,7 +266,7 @@ impl ChatWidget {
     pub(crate) fn open_marketplace_add_prompt(&mut self) {
         self.plugins_active_tab_id = Some(ADD_MARKETPLACE_TAB_ID.to_string());
         let tx = self.app_event_tx.clone();
-        let cwd = self.config.cwd.to_path_buf();
+        let cwd = self.discovery_cwd().to_path_buf();
         let view = CustomPromptView::new(
             "Add marketplace".to_string(),
             "owner/repo, git URL, or local marketplace path".to_string(),
@@ -332,7 +332,7 @@ impl ChatWidget {
         cwd: PathBuf,
         result: Result<PluginReadResponse, String>,
     ) {
-        if self.config.cwd.as_path() != cwd.as_path() {
+        if self.discovery_cwd().as_path() != cwd.as_path() {
             return;
         }
 
@@ -367,7 +367,7 @@ impl ChatWidget {
         plugin_display_name: String,
         result: Result<PluginInstallResponse, String>,
     ) -> bool {
-        if self.config.cwd.as_path() != cwd.as_path() {
+        if self.discovery_cwd().as_path() != cwd.as_path() {
             return true;
         }
 
@@ -425,7 +425,7 @@ impl ChatWidget {
         _source: String,
         result: Result<MarketplaceAddResponse, String>,
     ) {
-        if self.config.cwd.as_path() != cwd.as_path() {
+        if self.discovery_cwd().as_path() != cwd.as_path() {
             return;
         }
 
@@ -472,7 +472,7 @@ impl ChatWidget {
         enabled: bool,
         result: Result<(), String>,
     ) {
-        if self.config.cwd.as_path() != cwd.as_path() {
+        if self.discovery_cwd().as_path() != cwd.as_path() {
             return;
         }
 
@@ -514,7 +514,7 @@ impl ChatWidget {
         plugin_display_name: String,
         result: Result<PluginUninstallResponse, String>,
     ) {
-        if self.config.cwd.as_path() != cwd.as_path() {
+        if self.discovery_cwd().as_path() != cwd.as_path() {
             return;
         }
 
@@ -889,7 +889,7 @@ impl ChatWidget {
         ];
 
         if let PluginsCacheState::Ready(plugins_response) = self.plugins_cache_for_current_cwd() {
-            let cwd = self.config.cwd.to_path_buf();
+            let cwd = self.discovery_cwd().to_path_buf();
             items.push(SelectionItem {
                 name: "Back to plugins".to_string(),
                 description: Some("Return to the plugin list.".to_string()),
@@ -929,7 +929,7 @@ impl ChatWidget {
             ..Default::default()
         }];
         if let Some(plugins_response) = plugins_response.cloned() {
-            let cwd = self.config.cwd.to_path_buf();
+            let cwd = self.discovery_cwd().to_path_buf();
             items.push(SelectionItem {
                 name: "Back to plugins".to_string(),
                 description: Some("Return to the plugin list.".to_string()),
@@ -1181,7 +1181,7 @@ impl ChatWidget {
             header.push(Line::from(description.dim()));
         }
 
-        let cwd = self.config.cwd.to_path_buf();
+        let cwd = self.discovery_cwd().to_path_buf();
         let plugins_response = plugins_response.clone();
         let mut items = vec![SelectionItem {
             name: "Back to plugins".to_string(),
@@ -1197,7 +1197,7 @@ impl ChatWidget {
         }];
 
         if plugin.summary.installed {
-            let uninstall_cwd = self.config.cwd.to_path_buf();
+            let uninstall_cwd = self.discovery_cwd().to_path_buf();
             let plugin_id = plugin.summary.id.clone();
             let plugin_display_name = display_name;
             items.push(SelectionItem {
@@ -1226,7 +1226,7 @@ impl ChatWidget {
                 ..Default::default()
             });
         } else if let Some(marketplace_path) = plugin.marketplace_path.clone() {
-            let install_cwd = self.config.cwd.to_path_buf();
+            let install_cwd = self.discovery_cwd().to_path_buf();
             let plugin_name = plugin.summary.name.clone();
             let plugin_display_name = display_name;
             items.push(SelectionItem {
@@ -1327,7 +1327,7 @@ impl ChatWidget {
                 "{display_name} {} {} {}",
                 plugin.id, plugin.name, marketplace_label
             );
-            let cwd = self.config.cwd.to_path_buf();
+            let cwd = self.discovery_cwd().to_path_buf();
             let plugin_display_name = display_name.clone();
             let marketplace_path = marketplace.path.clone();
             let plugin_name = plugin.name.clone();

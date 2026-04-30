@@ -1490,6 +1490,12 @@ pub(crate) async fn read_session_cwd(
     thread_id: ThreadId,
     path: Option<&Path>,
 ) -> Option<PathBuf> {
+    if let Some(path) = path
+        && let Some(cwd) = read_latest_turn_context(path).await.map(|item| item.cwd)
+    {
+        return Some(cwd);
+    }
+
     if let Some(state_db_ctx) = get_state_db(config).await
         && let Ok(Some(metadata)) = state_db_ctx.get_thread(thread_id).await
     {
@@ -1502,9 +1508,6 @@ pub(crate) async fn read_session_cwd(
     // changes, but the rollout is an append-only JSONL log and rewriting the head
     // would be error-prone.
     let path = path?;
-    if let Some(cwd) = read_latest_turn_context(path).await.map(|item| item.cwd) {
-        return Some(cwd);
-    }
     match read_session_meta_line(path).await {
         Ok(meta_line) => Some(meta_line.meta.cwd),
         Err(err) => {
@@ -2447,7 +2450,7 @@ trust_level = "untrusted"
     }
 
     #[tokio::test]
-    async fn read_session_cwd_prefers_sqlite_when_thread_id_present() -> std::io::Result<()> {
+    async fn read_session_cwd_prefers_latest_turn_context_over_sqlite() -> std::io::Result<()> {
         let temp_dir = TempDir::new()?;
         let mut config = build_config(&temp_dir).await?;
         config
@@ -2501,7 +2504,7 @@ trust_level = "untrusted"
         let cwd = read_session_cwd(&config, thread_id, Some(&rollout_path))
             .await
             .expect("expected cwd");
-        assert_eq!(cwd, sqlite_cwd);
+        assert_eq!(cwd, rollout_cwd);
         Ok(())
     }
 }

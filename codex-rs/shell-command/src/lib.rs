@@ -3,6 +3,7 @@
 mod shell_detect;
 
 pub mod bash;
+pub mod cd;
 pub(crate) mod command_safety;
 pub mod parse_command;
 pub mod powershell;
