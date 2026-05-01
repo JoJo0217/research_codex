@@ -674,6 +674,7 @@ impl App {
         remote_app_server_url: Option<String>,
         remote_app_server_auth_token: Option<String>,
         environment_manager: Arc<EnvironmentManager>,
+        initial_runtime_cwd_override: Option<PathBuf>,
     ) -> Result<AppExitInfo> {
         use tokio_stream::StreamExt;
         let (app_event_tx, mut app_event_rx) = unbounded_channel();
@@ -889,7 +890,11 @@ impl App {
         chat_widget
             .maybe_prompt_windows_sandbox_enable(should_prompt_windows_sandbox_nux_at_startup);
 
-        let file_search = FileSearchManager::new(config.cwd.to_path_buf(), app_event_tx.clone());
+        let file_search = FileSearchManager::new(
+            config.cwd.to_path_buf(),
+            config.file_mentions_respect_gitignore,
+            app_event_tx.clone(),
+        );
         let runtime_keymap = RuntimeKeymap::from_config(&config.tui_keymap).map_err(|err| {
             color_eyre::eyre::eyre!(
                 "Invalid `tui.keymap` configuration: {err}\n\
@@ -948,8 +953,12 @@ See the Codex keymap documentation for supported actions and examples."
             pending_plugin_enabled_writes: HashMap::new(),
         };
         if let Some(started) = initial_started_thread {
-            app.enqueue_primary_thread_session(started.session, started.turns)
-                .await?;
+            app.enqueue_primary_thread_session(
+                started.session,
+                started.turns,
+                initial_runtime_cwd_override,
+            )
+            .await?;
         }
 
         // On startup, if a managed filesystem sandbox is active, warn about

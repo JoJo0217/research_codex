@@ -203,6 +203,8 @@ use codex_app_server_protocol::ThreadRealtimeStopResponse;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadRollbackParams;
+use codex_app_server_protocol::ThreadRuntimeCwdUpdateParams;
+use codex_app_server_protocol::ThreadRuntimeCwdUpdateResponse;
 use codex_app_server_protocol::ThreadSetNameParams;
 use codex_app_server_protocol::ThreadSetNameResponse;
 use codex_app_server_protocol::ThreadShellCommandParams;
@@ -1028,6 +1030,10 @@ impl CodexMessageProcessor {
             }
             ClientRequest::ThreadSetName { request_id, params } => {
                 self.thread_set_name(to_connection_request_id(request_id), params)
+                    .await;
+            }
+            ClientRequest::ThreadRuntimeCwdUpdate { request_id, params } => {
+                self.thread_runtime_cwd_update(to_connection_request_id(request_id), params)
                     .await;
             }
             ClientRequest::ThreadGoalSet { request_id, params } => {
@@ -3208,6 +3214,40 @@ impl CodexMessageProcessor {
                 thread_name: Some(name),
             }),
         ))
+    }
+
+    async fn thread_runtime_cwd_update(
+        &self,
+        request_id: ConnectionRequestId,
+        params: ThreadRuntimeCwdUpdateParams,
+    ) {
+        let result = async {
+            let ThreadRuntimeCwdUpdateParams { thread_id, cwd } = params;
+            let (_, thread) = self.load_thread(&thread_id).await?;
+            self.submit_core_op(
+                &request_id,
+                thread.as_ref(),
+                Op::OverrideTurnContext {
+                    cwd: Some(cwd),
+                    approval_policy: None,
+                    approvals_reviewer: None,
+                    sandbox_policy: None,
+                    permission_profile: None,
+                    windows_sandbox_level: None,
+                    model: None,
+                    effort: None,
+                    summary: None,
+                    service_tier: None,
+                    collaboration_mode: None,
+                    personality: None,
+                },
+            )
+            .await
+            .map_err(|err| internal_error(format!("failed to update thread cwd: {err}")))?;
+            Ok::<_, JSONRPCErrorError>(ThreadRuntimeCwdUpdateResponse {})
+        }
+        .await;
+        self.outgoing.send_result(request_id, result).await;
     }
 
     async fn thread_memory_mode_set(

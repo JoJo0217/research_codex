@@ -8,6 +8,33 @@ use codex_protocol::models::PermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 impl App {
+    pub(super) async fn apply_runtime_cwd_override(
+        &mut self,
+        thread_id: ThreadId,
+        cwd: AbsolutePathBuf,
+    ) {
+        self.config.cwd = cwd.clone();
+        self.file_search.update_search_dir(cwd.to_path_buf());
+        self.chat_widget.set_runtime_cwd(cwd.clone());
+        self.sync_thread_cwd_to_cached_session(thread_id, cwd.clone())
+            .await;
+        self.app_event_tx.send(crate::app_event::AppEvent::CodexOp(
+            crate::app_command::AppCommand::override_turn_context(
+                Some(cwd.to_path_buf()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        ));
+    }
+
     pub(super) async fn sync_thread_cwd_to_cached_session(
         &mut self,
         thread_id: ThreadId,

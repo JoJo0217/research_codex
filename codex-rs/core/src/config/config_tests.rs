@@ -549,6 +549,7 @@ fn config_toml_deserializes_model_availability_nux() {
             notification_settings: TuiNotificationSettings::default(),
             animations: true,
             show_tooltips: true,
+            file_mentions_respect_gitignore: true,
             alternate_screen: AltScreenMode::default(),
             status_line: None,
             terminal_title: None,
@@ -579,6 +580,22 @@ terminal_resize_reflow_max_rows = 9000
             .expect("tui config should deserialize")
             .terminal_resize_reflow_max_rows,
         Some(9000)
+    );
+}
+
+#[test]
+fn config_toml_deserializes_file_mentions_respect_gitignore() {
+    let toml = r#"
+[tui]
+file_mentions_respect_gitignore = false
+"#;
+    let cfg: ConfigToml =
+        toml::from_str(toml).expect("TOML deserialization should succeed for file mentions config");
+
+    assert!(
+        !cfg.tui
+            .expect("tui config should deserialize")
+            .file_mentions_respect_gitignore
     );
 }
 
@@ -2062,6 +2079,7 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
             notification_settings: TuiNotificationSettings::default(),
             animations: true,
             show_tooltips: true,
+            file_mentions_respect_gitignore: true,
             alternate_screen: AltScreenMode::Auto,
             status_line: None,
             terminal_title: None,
@@ -6367,6 +6385,7 @@ async fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
             tui_notifications: Default::default(),
             animations: true,
             show_tooltips: true,
+            file_mentions_respect_gitignore: true,
             model_availability_nux: ModelAvailabilityNuxConfig::default(),
             terminal_resize_reflow: TerminalResizeReflowConfig::default(),
             analytics_enabled: Some(true),
@@ -6563,6 +6582,7 @@ async fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
         tui_notifications: Default::default(),
         animations: true,
         show_tooltips: true,
+        file_mentions_respect_gitignore: true,
         model_availability_nux: ModelAvailabilityNuxConfig::default(),
         terminal_resize_reflow: TerminalResizeReflowConfig::default(),
         analytics_enabled: Some(true),
@@ -6713,6 +6733,7 @@ async fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
         tui_notifications: Default::default(),
         animations: true,
         show_tooltips: true,
+        file_mentions_respect_gitignore: true,
         model_availability_nux: ModelAvailabilityNuxConfig::default(),
         terminal_resize_reflow: TerminalResizeReflowConfig::default(),
         analytics_enabled: Some(false),
@@ -6848,6 +6869,7 @@ async fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
         tui_notifications: Default::default(),
         animations: true,
         show_tooltips: true,
+        file_mentions_respect_gitignore: true,
         model_availability_nux: ModelAvailabilityNuxConfig::default(),
         terminal_resize_reflow: TerminalResizeReflowConfig::default(),
         analytics_enabled: Some(true),

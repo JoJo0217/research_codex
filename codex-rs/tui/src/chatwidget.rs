@@ -12454,6 +12454,17 @@ impl ChatWidget {
         &self.config
     }
 
+    pub(crate) fn set_runtime_cwd(&mut self, cwd: AbsolutePathBuf) {
+        self.current_cwd = Some(cwd.to_path_buf());
+        self.config.cwd = cwd;
+        self.status_line_project_root_name_cache = None;
+        self.status_line_branch = None;
+        self.status_line_branch_cwd = None;
+        self.status_line_branch_pending = false;
+        self.status_line_branch_lookup_complete = false;
+        self.refresh_status_surfaces();
+    }
+
     #[cfg(test)]
     pub(crate) fn status_line_text(&self) -> Option<String> {
         self.bottom_pane.status_line_text()

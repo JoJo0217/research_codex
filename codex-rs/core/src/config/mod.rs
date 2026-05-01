@@ -504,6 +504,9 @@ pub struct Config {
     /// Show startup tooltips in the TUI welcome screen.
     pub show_tooltips: bool,
 
+    /// Respect `.gitignore` and related ignore files when searching `@` file mentions.
+    pub file_mentions_respect_gitignore: bool,
+
     /// Persisted startup availability NUX state for model tooltips.
     pub model_availability_nux: ModelAvailabilityNuxConfig,
 
@@ -2978,6 +2981,11 @@ impl Config {
                 .unwrap_or_default(),
             animations: cfg.tui.as_ref().map(|t| t.animations).unwrap_or(true),
             show_tooltips: cfg.tui.as_ref().map(|t| t.show_tooltips).unwrap_or(true),
+            file_mentions_respect_gitignore: cfg
+                .tui
+                .as_ref()
+                .map(|t| t.file_mentions_respect_gitignore)
+                .unwrap_or(true),
             model_availability_nux: cfg
                 .tui
                 .as_ref()

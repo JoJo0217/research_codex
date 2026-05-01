@@ -1119,6 +1119,30 @@
             },
             "method": {
               "enum": [
+                "thread/runtimeCwd/update"
+              ],
+              "title": "Thread/runtimeCwd/updateRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/ThreadRuntimeCwdUpdateParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/runtimeCwd/updateRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
                 "thread/metadata/update"
               ],
               "title": "Thread/metadata/updateRequestMethod",
@@ -13827,6 +13851,12 @@
             "id": {
               "type": "string"
             },
+            "summary": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "type": {
               "enum": [
                 "contextCompaction"
@@ -14613,6 +14643,28 @@
         "thread"
       ],
       "title": "ThreadRollbackResponse",
+      "type": "object"
+    },
+    "ThreadRuntimeCwdUpdateParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "cwd": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "cwd",
+        "threadId"
+      ],
+      "title": "ThreadRuntimeCwdUpdateParams",
+      "type": "object"
+    },
+    "ThreadRuntimeCwdUpdateResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "ThreadRuntimeCwdUpdateResponse",
       "type": "object"
     },
     "ThreadSetNameParams": {

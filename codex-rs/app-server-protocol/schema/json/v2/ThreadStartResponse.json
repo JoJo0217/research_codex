@@ -2100,6 +2100,12 @@
             "id": {
               "type": "string"
             },
+            "summary": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "type": {
               "enum": [
                 "contextCompaction"

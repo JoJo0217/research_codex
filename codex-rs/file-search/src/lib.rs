@@ -1184,4 +1184,31 @@ mod tests {
                 .any(|m| m.path.as_path() == Path::new(".vscode/settings.json"))
         );
     }
+
+    #[test]
+    fn ignored_files_are_returned_when_gitignore_is_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join(".gitignore"), "ignored.txt\n").unwrap();
+        fs::write(repo.join("ignored.txt"), "hidden by gitignore\n").unwrap();
+
+        let results = run(
+            "ignored",
+            vec![repo],
+            FileSearchOptions {
+                respect_gitignore: false,
+                ..Default::default()
+            },
+            /*cancel_flag*/ None,
+        )
+        .expect("run ok");
+
+        assert!(
+            results
+                .matches
+                .iter()
+                .any(|m| m.path.as_path() == Path::new("ignored.txt"))
+        );
+    }
 }

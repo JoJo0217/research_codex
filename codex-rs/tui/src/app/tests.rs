@@ -492,6 +492,7 @@ async fn enqueue_primary_thread_session_replays_buffered_approval_after_attach()
     app.enqueue_primary_thread_session(
         test_thread_session(thread_id, test_path_buf("/tmp/project")),
         Vec::new(),
+        None,
     )
     .await?;
 
@@ -531,6 +532,40 @@ async fn enqueue_primary_thread_session_replays_buffered_approval_after_attach()
 }
 
 #[tokio::test]
+async fn resume_runtime_cwd_override_keeps_discovery_cwd() -> Result<()> {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let thread_id = ThreadId::new();
+    let discovery_cwd = app.chat_widget.discovery_cwd().clone();
+    let project_cwd = discovery_cwd.as_path().join("codebase/project").abs();
+
+    app.enqueue_primary_thread_session(
+        test_thread_session(thread_id, project_cwd.to_path_buf()),
+        Vec::new(),
+        Some(project_cwd.to_path_buf()),
+    )
+    .await?;
+
+    assert_eq!(app.config.cwd, project_cwd);
+    assert_eq!(app.chat_widget.config_ref().cwd, project_cwd);
+    assert_eq!(app.chat_widget.discovery_cwd(), &discovery_cwd);
+    assert_eq!(
+        app.primary_session_configured.as_ref().map(|s| &s.cwd),
+        Some(&project_cwd)
+    );
+
+    let mut saw_override = false;
+    while let Ok(event) = app_event_rx.try_recv() {
+        if let AppEvent::CodexOp(AppCommand::OverrideTurnContext { cwd, .. }) = event {
+            assert_eq!(cwd, Some(project_cwd.to_path_buf()));
+            saw_override = true;
+        }
+    }
+    assert!(saw_override, "runtime cwd override should be sent to core");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn resolved_buffered_approval_does_not_become_actionable_after_drain() -> Result<()> {
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
     let thread_id = ThreadId::new();
@@ -540,6 +575,7 @@ async fn resolved_buffered_approval_does_not_become_actionable_after_drain() -> 
     app.enqueue_primary_thread_session(
         test_thread_session(thread_id, test_path_buf("/tmp/project")),
         Vec::new(),
+        None,
     )
     .await?;
     while app_event_rx.try_recv().is_ok() {}
@@ -633,6 +669,7 @@ async fn enqueue_primary_thread_session_replays_turns_before_initial_prompt_subm
                 }],
             }],
         )],
+        None,
     )
     .await?;
 
@@ -3888,7 +3925,11 @@ async fn clear_ui_header_shows_fast_status_for_fast_capable_models() {
 async fn make_test_app() -> App {
     let (chat_widget, app_event_tx, _rx, _op_rx) = make_chatwidget_manual_with_sender().await;
     let config = chat_widget.config_ref().clone();
-    let file_search = FileSearchManager::new(config.cwd.to_path_buf(), app_event_tx.clone());
+    let file_search = FileSearchManager::new(
+        config.cwd.to_path_buf(),
+        config.file_mentions_respect_gitignore,
+        app_event_tx.clone(),
+    );
     let model = crate::legacy_core::test_support::get_model_offline(config.model.as_deref());
     let session_telemetry = test_session_telemetry(&config, model.as_str());
 
@@ -3948,7 +3989,11 @@ async fn make_test_app_with_channels() -> (
 ) {
     let (chat_widget, app_event_tx, rx, op_rx) = make_chatwidget_manual_with_sender().await;
     let config = chat_widget.config_ref().clone();
-    let file_search = FileSearchManager::new(config.cwd.to_path_buf(), app_event_tx.clone());
+    let file_search = FileSearchManager::new(
+        config.cwd.to_path_buf(),
+        config.file_mentions_respect_gitignore,
+        app_event_tx.clone(),
+    );
     let model = crate::legacy_core::test_support::get_model_offline(config.model.as_deref());
     let session_telemetry = test_session_telemetry(&config, model.as_str());
 
@@ -5456,7 +5501,7 @@ async fn interrupt_without_active_turn_is_treated_as_handled() {
         .await
         .expect("thread/start should succeed");
     let thread_id = started.session.thread_id;
-    app.enqueue_primary_thread_session(started.session, started.turns)
+    app.enqueue_primary_thread_session(started.session, started.turns, None)
         .await
         .expect("primary thread should be registered");
     let op = AppCommand::interrupt();

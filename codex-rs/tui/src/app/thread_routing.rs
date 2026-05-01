@@ -714,7 +714,14 @@ impl App {
                 self.refresh_in_memory_config_from_disk().await?;
                 Ok(true)
             }
-            AppCommandView::OverrideTurnContext { .. } => Ok(true),
+            AppCommandView::OverrideTurnContext { cwd, .. } => {
+                if let Some(cwd) = cwd {
+                    app_server
+                        .thread_runtime_cwd_update(thread_id, cwd.clone())
+                        .await?;
+                }
+                Ok(true)
+            }
             AppCommandView::ApproveGuardianDeniedAction { event }
             | AppCommandView::Other(Op::ApproveGuardianDeniedAction { event }) => {
                 app_server
@@ -1059,10 +1066,14 @@ impl App {
 
     pub(super) async fn enqueue_primary_thread_session(
         &mut self,
-        session: ThreadSessionState,
+        mut session: ThreadSessionState,
         turns: Vec<Turn>,
+        runtime_cwd_override: Option<PathBuf>,
     ) -> Result<()> {
         let thread_id = session.thread_id;
+        if runtime_cwd_override.is_some() {
+            session.cwd = self.config.cwd.clone();
+        }
         self.primary_thread_id = Some(thread_id);
         self.primary_session_configured = Some(session.clone());
         self.upsert_agent_picker_thread(
@@ -1078,6 +1089,10 @@ impl App {
         self.chat_widget
             .set_initial_user_message_submit_suppressed(/*suppressed*/ true);
         self.chat_widget.handle_thread_session(session);
+        if let Some(cwd) = runtime_cwd_override {
+            let cwd = AbsolutePathBuf::relative_to_current_dir(cwd)?;
+            self.apply_runtime_cwd_override(thread_id, cwd).await;
+        }
         let should_buffer_initial_replay =
             self.terminal_resize_reflow_enabled() && !turns.is_empty();
         if should_buffer_initial_replay {
@@ -1328,7 +1343,7 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_skills_list_response(&mut self, response: SkillsListResponse) {
         let response = list_skills_response_to_core(response);
-        let cwd = self.chat_widget.config_ref().cwd.clone();
+        let cwd = self.chat_widget.discovery_cwd().clone();
         let errors = errors_for_cwd(&cwd, &response);
         emit_skill_load_warnings(&self.app_event_tx, &errors);
         self.chat_widget.handle_skills_list_response(response);

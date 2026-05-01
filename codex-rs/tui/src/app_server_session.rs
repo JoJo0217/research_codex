@@ -77,6 +77,8 @@ use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadRollbackParams;
 use codex_app_server_protocol::ThreadRollbackResponse;
+use codex_app_server_protocol::ThreadRuntimeCwdUpdateParams;
+use codex_app_server_protocol::ThreadRuntimeCwdUpdateResponse;
 use codex_app_server_protocol::ThreadSetNameParams;
 use codex_app_server_protocol::ThreadSetNameResponse;
 use codex_app_server_protocol::ThreadShellCommandParams;
@@ -650,6 +652,26 @@ impl AppServerSession {
             })
             .await
             .wrap_err("thread/name/set failed in TUI")?;
+        Ok(())
+    }
+
+    pub(crate) async fn thread_runtime_cwd_update(
+        &mut self,
+        thread_id: ThreadId,
+        cwd: PathBuf,
+    ) -> Result<()> {
+        let request_id = self.next_request_id();
+        let _: ThreadRuntimeCwdUpdateResponse = self
+            .client
+            .request_typed(ClientRequest::ThreadRuntimeCwdUpdate {
+                request_id,
+                params: ThreadRuntimeCwdUpdateParams {
+                    thread_id: thread_id.to_string(),
+                    cwd,
+                },
+            })
+            .await
+            .wrap_err("thread/runtimeCwd/update failed in TUI")?;
         Ok(())
     }
 

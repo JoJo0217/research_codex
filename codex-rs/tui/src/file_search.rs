@@ -16,6 +16,7 @@ use crate::app_event_sender::AppEventSender;
 pub(crate) struct FileSearchManager {
     state: Arc<Mutex<SearchState>>,
     search_dir: PathBuf,
+    respect_gitignore: bool,
     app_tx: AppEventSender,
 }
 
@@ -26,7 +27,7 @@ struct SearchState {
 }
 
 impl FileSearchManager {
-    pub fn new(search_dir: PathBuf, tx: AppEventSender) -> Self {
+    pub fn new(search_dir: PathBuf, respect_gitignore: bool, tx: AppEventSender) -> Self {
         Self {
             state: Arc::new(Mutex::new(SearchState {
                 latest_query: String::new(),
@@ -34,6 +35,7 @@ impl FileSearchManager {
                 session_token: 0,
             })),
             search_dir,
+            respect_gitignore,
             app_tx: tx,
         }
     }
@@ -84,6 +86,7 @@ impl FileSearchManager {
             vec![self.search_dir.clone()],
             file_search::FileSearchOptions {
                 compute_indices: true,
+                respect_gitignore: self.respect_gitignore,
                 ..Default::default()
             },
             reporter,

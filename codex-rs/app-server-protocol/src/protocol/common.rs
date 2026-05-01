@@ -483,6 +483,11 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadSetNameResponse,
     },
+    ThreadRuntimeCwdUpdate => "thread/runtimeCwd/update" {
+        params: v2::ThreadRuntimeCwdUpdateParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadRuntimeCwdUpdateResponse,
+    },
     #[experimental("thread/goal/set")]
     ThreadGoalSet => "thread/goal/set" {
         params: v2::ThreadGoalSetParams,

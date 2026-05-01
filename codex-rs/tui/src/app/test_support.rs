@@ -10,7 +10,11 @@ use crate::chatwidget::tests::make_chatwidget_manual_with_sender;
 pub(super) async fn make_test_app() -> App {
     let (chat_widget, app_event_tx, _rx, _op_rx) = make_chatwidget_manual_with_sender().await;
     let config = chat_widget.config_ref().clone();
-    let file_search = FileSearchManager::new(config.cwd.to_path_buf(), app_event_tx.clone());
+    let file_search = FileSearchManager::new(
+        config.cwd.to_path_buf(),
+        config.file_mentions_respect_gitignore,
+        app_event_tx.clone(),
+    );
     let model = crate::legacy_core::test_support::get_model_offline(config.model.as_deref());
     let session_telemetry = test_session_telemetry(&config, model.as_str());
 

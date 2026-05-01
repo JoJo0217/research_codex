@@ -609,6 +609,11 @@ pub struct Tui {
     #[serde(default = "default_true")]
     pub show_tooltips: bool,
 
+    /// Respect `.gitignore` and related ignore files when searching `@` file mentions.
+    /// Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub file_mentions_respect_gitignore: bool,
+
     /// Controls whether the TUI uses the terminal's alternate screen buffer.
     ///
     /// - `auto` (default): Disable alternate screen in Zellij, enable elsewhere.

@@ -3939,6 +3939,21 @@
       ],
       "type": "object"
     },
+    "ThreadRuntimeCwdUpdateParams": {
+      "properties": {
+        "cwd": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "cwd",
+        "threadId"
+      ],
+      "type": "object"
+    },
     "ThreadSetNameParams": {
       "properties": {
         "name": {
@@ -4671,6 +4686,30 @@
         "params"
       ],
       "title": "Thread/name/setRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "thread/runtimeCwd/update"
+          ],
+          "title": "Thread/runtimeCwd/updateRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadRuntimeCwdUpdateParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Thread/runtimeCwd/updateRequest",
       "type": "object"
     },
     {

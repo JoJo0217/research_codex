@@ -462,6 +462,7 @@ impl App {
                         app_server,
                         started,
                         initial_user_message,
+                        None,
                     )
                     .await
                 {
@@ -496,6 +497,7 @@ impl App {
         app_server: &mut AppServerSession,
         started: AppServerStartedThread,
         initial_user_message: Option<crate::chatwidget::UserMessage>,
+        runtime_cwd_override: Option<PathBuf>,
     ) -> Result<()> {
         // Initial messages are for freshly attached primary threads only. Thread switches and
         // resume/fork flows pass `None` so they cannot replay old history and then auto-submit a new
@@ -507,7 +509,7 @@ impl App {
             initial_user_message,
         );
         self.replace_chat_widget(ChatWidget::new_with_app_event(init));
-        self.enqueue_primary_thread_session(started.session, started.turns)
+        self.enqueue_primary_thread_session(started.session, started.turns, runtime_cwd_override)
             .await?;
         self.backfill_loaded_subagent_threads(app_server).await;
         Ok(())
@@ -632,14 +634,14 @@ impl App {
             return Ok(AppRunControl::Continue);
         }
 
-        let current_cwd = self.config.cwd.to_path_buf();
+        let discovery_cwd = self.chat_widget.discovery_cwd().to_path_buf();
         let resume_cwd = if self.remote_app_server_url.is_some() {
-            current_cwd.clone()
+            discovery_cwd.clone()
         } else {
             match crate::resolve_cwd_for_resume_or_fork(
                 tui,
                 &self.config,
-                &current_cwd,
+                &discovery_cwd,
                 target_session.thread_id,
                 target_session.path.as_deref(),
                 CwdPromptAction::Resume,
@@ -648,15 +650,16 @@ impl App {
             .await?
             {
                 crate::ResolveCwdOutcome::Continue(Some(cwd)) => cwd,
-                crate::ResolveCwdOutcome::Continue(None) => current_cwd.clone(),
+                crate::ResolveCwdOutcome::Continue(None) => discovery_cwd.clone(),
                 crate::ResolveCwdOutcome::Exit => {
                     return Ok(AppRunControl::Exit(ExitReason::UserRequested));
                 }
             }
         };
 
+        let runtime_cwd_override = Some(resume_cwd);
         let mut resume_config = match self
-            .rebuild_config_for_resume_or_fallback(&current_cwd, resume_cwd)
+            .rebuild_config_for_resume_or_fallback(&discovery_cwd, discovery_cwd.clone())
             .await
         {
             Ok(cfg) => cfg,
@@ -690,7 +693,11 @@ impl App {
                     .update_search_dir(self.config.cwd.to_path_buf());
                 match self
                     .replace_chat_widget_with_app_server_thread(
-                        tui, app_server, resumed, /*initial_user_message*/ None,
+                        tui,
+                        app_server,
+                        resumed,
+                        /*initial_user_message*/ None,
+                        runtime_cwd_override,
                     )
                     .await
                 {

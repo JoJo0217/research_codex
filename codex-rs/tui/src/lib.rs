@@ -1346,7 +1346,7 @@ async fn run_ratatui_app(
         }
         _ => None,
     };
-    let fallback_cwd = match action_and_target_session_if_resume_or_fork {
+    let selected_runtime_cwd = match action_and_target_session_if_resume_or_fork {
         Some((action, target_session)) => {
             if remote_mode {
                 Some(current_cwd.to_path_buf())
@@ -1379,6 +1379,9 @@ async fn run_ratatui_app(
         }
         None => None,
     };
+    let initial_runtime_cwd_override = action_and_target_session_if_resume_or_fork
+        .is_some()
+        .then(|| selected_runtime_cwd.unwrap_or_else(|| current_cwd.to_path_buf()));
 
     let mut config = match &session_selection {
         resume_picker::SessionSelection::Resume(_) | resume_picker::SessionSelection::Fork(_) => {
@@ -1386,7 +1389,7 @@ async fn run_ratatui_app(
                 cli_kv_overrides.clone(),
                 overrides.clone(),
                 cloud_requirements.clone(),
-                fallback_cwd,
+                Some(current_cwd.to_path_buf()),
             )
             .await
         }
@@ -1462,6 +1465,7 @@ async fn run_ratatui_app(
         remote_url,
         remote_auth_token,
         environment_manager,
+        initial_runtime_cwd_override,
     )
     .await;
 
