@@ -206,19 +206,29 @@ impl App {
             AppEvent::ReplaceTranscriptWithCompactionSummary(cell) => {
                 let cell: Arc<dyn HistoryCell> = cell.into();
                 self.clear_terminal_ui(tui, /*redraw_header*/ true)?;
-                self.transcript_cells.clear();
-                self.transcript_cells.push(cell.clone());
-                self.transcript_reflow.clear();
-                self.reset_backtrack_state_and_pending_restore();
+                // Keep the in-memory transcript as the rewind/checkpoint journal. Compaction only
+                // replaces the visible scrollback/model context; clearing these cells would erase
+                // pre-compact backtrack targets and their file restore metadata.
+                self.record_compaction_summary_for_backtrack(cell.clone());
+                let visible_cells = self.visible_transcript_cells().to_vec();
                 if let Some(Overlay::Transcript(t)) = &mut self.overlay {
-                    t.replace_cells(self.transcript_cells.clone());
+                    t.replace_cells(visible_cells);
+                    t.set_highlight_cell(None);
                     tui.frame_requester().schedule_frame();
                 }
-                self.insert_history_cell_lines(
-                    tui,
-                    cell.as_ref(),
-                    tui.terminal.last_known_screen_size.width,
-                );
+                if self.initial_history_replay_buffer.as_ref().is_some() {
+                    self.insert_history_cell_lines_with_initial_replay_buffer(
+                        tui,
+                        cell.as_ref(),
+                        tui.terminal.last_known_screen_size.width,
+                    );
+                } else {
+                    self.insert_history_cell_lines(
+                        tui,
+                        cell.as_ref(),
+                        tui.terminal.last_known_screen_size.width,
+                    );
+                }
             }
             AppEvent::EndInitialHistoryReplayBuffer => {
                 self.finish_initial_history_replay_buffer(tui);
@@ -236,9 +246,11 @@ impl App {
                         Arc::new(history_cell::AgentMarkdownCell::new(source, &cwd));
                     self.transcript_cells
                         .splice(start..end, std::iter::once(consolidated.clone()));
+                    self.invalidate_deferred_history_after_transcript_mutation();
 
+                    let overlay_cells = self.current_overlay_transcript_cells();
                     if let Some(Overlay::Transcript(t)) = &mut self.overlay {
-                        t.consolidate_cells(start..end, consolidated.clone());
+                        t.replace_cells(overlay_cells);
                         tui.frame_requester().schedule_frame();
                     }
 
@@ -262,9 +274,11 @@ impl App {
                 if start < end {
                     self.transcript_cells
                         .splice(start..end, std::iter::once(consolidated.clone()));
+                    self.invalidate_deferred_history_after_transcript_mutation();
 
+                    let overlay_cells = self.current_overlay_transcript_cells();
                     if let Some(Overlay::Transcript(t)) = &mut self.overlay {
-                        t.consolidate_cells(start..end, consolidated.clone());
+                        t.replace_cells(overlay_cells);
                         tui.frame_requester().schedule_frame();
                     }
 

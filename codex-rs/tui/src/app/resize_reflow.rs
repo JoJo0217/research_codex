@@ -378,7 +378,7 @@ impl App {
 
     fn reflow_transcript_now(&mut self, tui: &mut tui::Tui) -> Result<u16> {
         let width = tui.terminal.size()?.width;
-        if self.transcript_cells.is_empty() {
+        if self.visible_transcript_cells().is_empty() {
             // Drop any queued pre-resize/pre-consolidation inserts before rebuilding from cells.
             tui.clear_pending_history_lines();
             self.reset_history_emission_state();
@@ -411,11 +411,12 @@ impl App {
         let row_cap = self.resize_reflow_max_rows();
         let mut cell_displays = VecDeque::new();
         let mut rendered_rows = 0usize;
-        let mut start = self.transcript_cells.len();
+        let cells = self.visible_transcript_cells();
+        let mut start = cells.len();
 
         while start > 0 {
             start -= 1;
-            let cell = self.transcript_cells[start].clone();
+            let cell = cells[start].clone();
             let lines = cell.display_lines(width);
             rendered_rows += lines.len();
             cell_displays.push_front(ReflowCellDisplay {
@@ -434,7 +435,7 @@ impl App {
                 .is_some_and(|display| display.is_stream_continuation)
         {
             start -= 1;
-            let cell = self.transcript_cells[start].clone();
+            let cell = cells[start].clone();
             cell_displays.push_front(ReflowCellDisplay {
                 lines: cell.display_lines(width),
                 is_stream_continuation: cell.is_stream_continuation(),

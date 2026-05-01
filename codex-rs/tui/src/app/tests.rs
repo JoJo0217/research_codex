@@ -131,6 +131,210 @@ async fn handle_mcp_inventory_result_clears_committed_loading_cell() {
     assert_eq!(app.transcript_cells.len(), 0);
 }
 
+#[tokio::test]
+async fn clearing_pre_compact_mcp_loading_rebases_visible_start() {
+    let mut app = make_test_app().await;
+    app.transcript_cells = vec![
+        Arc::new(history_cell::new_mcp_inventory_loading(
+            /*animations_enabled*/ false,
+        )) as Arc<dyn HistoryCell>,
+        Arc::new(UserHistoryCell {
+            message: "before compact".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: Vec::new(),
+        }) as Arc<dyn HistoryCell>,
+        Arc::new(history_cell::new_context_compaction_summary(
+            Some("summary".to_string()),
+            app.chat_widget.config_ref().cwd.as_path(),
+        )) as Arc<dyn HistoryCell>,
+        plain_line_cell("after compact"),
+    ];
+    app.transcript_visible_start = 2;
+
+    app.clear_committed_mcp_inventory_loading();
+
+    assert_eq!(app.transcript_visible_start, 1);
+    let rendered_text = app
+        .render_transcript_lines_for_reflow(/*width*/ 80)
+        .lines
+        .iter()
+        .map(rendered_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!rendered_text.contains("before compact"));
+    assert!(rendered_text.contains("summary"));
+}
+
+#[tokio::test]
+async fn clearing_mcp_loading_drops_deferred_history_lines() {
+    let mut app = make_test_app().await;
+    app.transcript_cells = vec![Arc::new(history_cell::new_mcp_inventory_loading(
+        /*animations_enabled*/ false,
+    )) as Arc<dyn HistoryCell>];
+    app.overlay = Some(Overlay::new_transcript(
+        app.transcript_cells.clone(),
+        app.keymap.pager.clone(),
+    ));
+    app.deferred_history_lines
+        .push(Line::from("stale loading row"));
+
+    app.clear_committed_mcp_inventory_loading();
+
+    assert!(app.deferred_history_lines.is_empty());
+    assert!(app.backtrack_render_pending);
+}
+
+#[tokio::test]
+async fn compaction_resets_initial_replay_buffer() {
+    let mut app = make_test_app().await;
+    app.initial_history_replay_buffer = Some(Default::default());
+    if let Some(buffer) = &mut app.initial_history_replay_buffer {
+        buffer
+            .retained_lines
+            .push_back(Line::from("before compact"));
+    }
+    let summary = Arc::new(history_cell::new_context_compaction_summary(
+        Some("summary".to_string()),
+        app.chat_widget.config_ref().cwd.as_path(),
+    )) as Arc<dyn HistoryCell>;
+
+    app.record_compaction_summary_for_backtrack(summary);
+
+    assert!(app.initial_history_replay_buffer.is_some());
+    assert!(
+        app.initial_history_replay_buffer
+            .as_ref()
+            .is_some_and(|buffer| buffer.retained_lines.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn compaction_with_overlay_open_schedules_visible_replay() {
+    let mut app = make_test_app().await;
+    app.transcript_cells = vec![Arc::new(UserHistoryCell {
+        message: "before compact".to_string(),
+        text_elements: Vec::new(),
+        local_image_paths: Vec::new(),
+        remote_image_urls: Vec::new(),
+    }) as Arc<dyn HistoryCell>];
+    app.overlay = Some(Overlay::new_transcript(
+        app.transcript_cells.clone(),
+        app.keymap.pager.clone(),
+    ));
+    app.deferred_history_lines
+        .push(Line::from("stale before compact row"));
+    let summary = Arc::new(history_cell::new_context_compaction_summary(
+        Some("summary".to_string()),
+        app.chat_widget.config_ref().cwd.as_path(),
+    )) as Arc<dyn HistoryCell>;
+
+    app.record_compaction_summary_for_backtrack(summary);
+
+    assert!(app.deferred_history_lines.is_empty());
+    assert!(app.backtrack_render_pending);
+    assert_eq!(app.visible_transcript_cells().len(), 1);
+}
+
+#[tokio::test]
+async fn compaction_replacement_clears_overlay_highlight() {
+    let mut app = make_test_app().await;
+    app.transcript_cells = vec![Arc::new(UserHistoryCell {
+        message: "before compact".to_string(),
+        text_elements: Vec::new(),
+        local_image_paths: Vec::new(),
+        remote_image_urls: Vec::new(),
+    }) as Arc<dyn HistoryCell>];
+    let mut overlay =
+        match Overlay::new_transcript(app.transcript_cells.clone(), app.keymap.pager.clone()) {
+            Overlay::Transcript(overlay) => overlay,
+            _ => unreachable!(),
+        };
+    overlay.set_highlight_cell(Some(0));
+    app.overlay = Some(Overlay::Transcript(overlay));
+    let summary = Arc::new(history_cell::new_context_compaction_summary(
+        Some("summary".to_string()),
+        app.chat_widget.config_ref().cwd.as_path(),
+    )) as Arc<dyn HistoryCell>;
+    app.record_compaction_summary_for_backtrack(summary);
+    let visible_cells = app.visible_transcript_cells().to_vec();
+
+    if let Some(Overlay::Transcript(t)) = &mut app.overlay {
+        t.replace_cells(visible_cells);
+        t.set_highlight_cell(None);
+    }
+
+    let highlighted = match app.overlay.as_ref() {
+        Some(Overlay::Transcript(t)) => t.highlighted_cell(),
+        _ => panic!("expected transcript overlay"),
+    };
+    assert_eq!(highlighted, None);
+}
+
+#[tokio::test]
+async fn backtrack_overlay_uses_visible_transcript_suffix() {
+    let mut app = make_test_app().await;
+    app.transcript_cells = vec![
+        Arc::new(UserHistoryCell {
+            message: "before compact".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: Vec::new(),
+        }) as Arc<dyn HistoryCell>,
+        Arc::new(history_cell::new_context_compaction_summary(
+            Some("summary".to_string()),
+            app.chat_widget.config_ref().cwd.as_path(),
+        )) as Arc<dyn HistoryCell>,
+        Arc::new(UserHistoryCell {
+            message: "after compact".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: Vec::new(),
+        }) as Arc<dyn HistoryCell>,
+    ];
+    app.transcript_visible_start = 1;
+    app.backtrack.overlay_preview_active = true;
+
+    let visible_cells = app.current_overlay_transcript_cells();
+
+    assert_eq!(visible_cells.len(), 2);
+    let rendered_text = visible_cells
+        .iter()
+        .flat_map(|cell| cell.display_lines(80))
+        .map(|line| rendered_line_text(&line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!rendered_text.contains("before compact"));
+    assert!(rendered_text.contains("after compact"));
+}
+
+#[tokio::test]
+async fn pre_compaction_restore_target_is_rejected_before_file_restore() {
+    let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    app.transcript_cells = vec![
+        Arc::new(UserHistoryCell {
+            message: "before compact".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: Vec::new(),
+        }) as Arc<dyn HistoryCell>,
+        Arc::new(history_cell::new_context_compaction_summary(
+            Some("summary".to_string()),
+            app.chat_widget.config_ref().cwd.as_path(),
+        )) as Arc<dyn HistoryCell>,
+        Arc::new(UserHistoryCell {
+            message: "after compact".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: Vec::new(),
+        }) as Arc<dyn HistoryCell>,
+    ];
+    app.transcript_visible_start = 1;
+
+    assert!(!app.is_backtrack_selection_rollback_safe(0));
+    assert!(app.is_backtrack_selection_rollback_safe(1));
+}
+
 #[test]
 fn startup_waiting_gate_is_only_for_fresh_or_exit_session_selection() {
     assert_eq!(
@@ -3701,6 +3905,7 @@ async fn make_test_app() -> App {
         runtime_permission_profile_override: None,
         file_search,
         transcript_cells: Vec::new(),
+        transcript_visible_start: 0,
         overlay: None,
         deferred_history_lines: Vec::new(),
         has_emitted_history_lines: false,
@@ -3761,6 +3966,7 @@ async fn make_test_app_with_channels() -> (
             runtime_permission_profile_override: None,
             file_search,
             transcript_cells: Vec::new(),
+            transcript_visible_start: 0,
             overlay: None,
             deferred_history_lines: Vec::new(),
             has_emitted_history_lines: false,
@@ -4806,6 +5012,297 @@ async fn queued_rollback_syncs_overlay_and_clears_deferred_history() {
         _ => panic!("expected transcript overlay"),
     };
     assert_eq!(overlay_cell_count, app.transcript_cells.len());
+}
+
+#[tokio::test]
+async fn compaction_preserves_backtrack_targets_and_file_snapshots() {
+    let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let thread_id = ThreadId::new();
+    app.chat_widget.handle_codex_event(Event {
+        id: String::new(),
+        msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
+            session_id: thread_id,
+            forked_from_id: None,
+            thread_name: None,
+            model: "gpt-test".to_string(),
+            model_provider_id: "test-provider".to_string(),
+            service_tier: None,
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: ApprovalsReviewer::User,
+            permission_profile: PermissionProfile::read_only(),
+            active_permission_profile: None,
+            cwd: test_path_buf("/tmp/project").abs(),
+            reasoning_effort: None,
+            history_log_id: 0,
+            history_entry_count: 0,
+            initial_messages: None,
+            network_proxy: None,
+            rollout_path: Some(PathBuf::new()),
+        }),
+    });
+    app.chat_widget.handle_codex_event_replay(Event {
+        id: "user-1".to_string(),
+        msg: EventMsg::UserMessage(codex_protocol::protocol::UserMessageEvent {
+            message: "before compact".to_string(),
+            images: None,
+            local_images: Vec::new(),
+            text_elements: Vec::new(),
+        }),
+    });
+    app.transcript_cells = vec![Arc::new(UserHistoryCell {
+        message: "before compact".to_string(),
+        text_elements: Vec::new(),
+        local_image_paths: Vec::new(),
+        remote_image_urls: Vec::new(),
+    }) as Arc<dyn HistoryCell>];
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("note.txt");
+    std::fs::write(&path, b"old").unwrap();
+    let mut changes = HashMap::new();
+    changes.insert(
+        path.clone(),
+        FileChange::Update {
+            unified_diff: String::new(),
+            move_path: None,
+        },
+    );
+    app.chat_widget.handle_codex_event(Event {
+        id: "patch-begin".to_string(),
+        msg: EventMsg::PatchApplyBegin(codex_protocol::protocol::PatchApplyBeginEvent {
+            call_id: "patch-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            auto_approved: true,
+            changes: changes.clone(),
+        }),
+    });
+    std::fs::write(&path, b"new").unwrap();
+    app.chat_widget.handle_codex_event(Event {
+        id: "patch-end".to_string(),
+        msg: EventMsg::PatchApplyEnd(codex_protocol::protocol::PatchApplyEndEvent {
+            call_id: "patch-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            stdout: String::new(),
+            stderr: String::new(),
+            success: true,
+            changes,
+            status: codex_protocol::protocol::PatchApplyStatus::Completed,
+        }),
+    });
+    assert!(app.chat_widget.has_backtrack_file_snapshots_after(0));
+
+    app.backtrack.primed = true;
+    let summary = Arc::new(history_cell::new_context_compaction_summary(
+        Some("summary".to_string()),
+        app.chat_widget.config_ref().cwd.as_path(),
+    )) as Arc<dyn HistoryCell>;
+    app.record_compaction_summary_for_backtrack(summary);
+
+    assert_eq!(user_count(&app.transcript_cells), 1);
+    assert_eq!(app.visible_transcript_cells().len(), 1);
+    assert!(!app.backtrack.primed);
+    assert!(app.chat_widget.has_backtrack_file_snapshots_after(0));
+
+    app.chat_widget.restore_files_for_backtrack(0).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"old");
+}
+
+#[tokio::test]
+async fn backtrack_does_not_submit_pre_compaction_target() {
+    let (mut app, _app_event_rx, mut op_rx) = make_test_app_with_channels().await;
+    let summary = Arc::new(history_cell::new_context_compaction_summary(
+        Some("summary".to_string()),
+        app.chat_widget.config_ref().cwd.as_path(),
+    )) as Arc<dyn HistoryCell>;
+    app.transcript_cells = vec![
+        Arc::new(UserHistoryCell {
+            message: "first".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: Vec::new(),
+        }) as Arc<dyn HistoryCell>,
+        plain_line_cell("answer first"),
+        Arc::new(UserHistoryCell {
+            message: "second".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: Vec::new(),
+        }) as Arc<dyn HistoryCell>,
+        summary,
+        Arc::new(UserHistoryCell {
+            message: "after compact".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: Vec::new(),
+        }) as Arc<dyn HistoryCell>,
+    ];
+    app.transcript_visible_start = 3;
+
+    app.apply_backtrack_rollback(
+        crate::app_backtrack::BacktrackSelection {
+            nth_user_message: 1,
+            prefill: "second".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: Vec::new(),
+        },
+        None,
+    );
+
+    let mut rollback_turns = None;
+    while let Ok(op) = op_rx.try_recv() {
+        if let Op::ThreadRollback { num_turns } = op {
+            rollback_turns = Some(num_turns);
+        }
+    }
+    assert_eq!(rollback_turns, None);
+}
+
+#[tokio::test]
+async fn backtrack_submits_post_compaction_target() {
+    let (mut app, _app_event_rx, mut op_rx) = make_test_app_with_channels().await;
+    let summary = Arc::new(history_cell::new_context_compaction_summary(
+        Some("summary".to_string()),
+        app.chat_widget.config_ref().cwd.as_path(),
+    )) as Arc<dyn HistoryCell>;
+    app.transcript_cells = vec![
+        Arc::new(UserHistoryCell {
+            message: "before compact".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: Vec::new(),
+        }) as Arc<dyn HistoryCell>,
+        summary,
+        Arc::new(UserHistoryCell {
+            message: "after compact".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: Vec::new(),
+        }) as Arc<dyn HistoryCell>,
+    ];
+    app.transcript_visible_start = 1;
+
+    app.apply_backtrack_rollback(
+        crate::app_backtrack::BacktrackSelection {
+            nth_user_message: 1,
+            prefill: "after compact".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: Vec::new(),
+        },
+        None,
+    );
+
+    let mut rollback_turns = None;
+    while let Ok(op) = op_rx.try_recv() {
+        if let Op::ThreadRollback { num_turns } = op {
+            rollback_turns = Some(num_turns);
+        }
+    }
+    assert_eq!(rollback_turns, Some(1));
+}
+
+#[tokio::test]
+async fn resize_reflow_uses_compacted_visible_suffix() {
+    let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Disabled;
+    app.transcript_cells = vec![
+        plain_line_cell("before compact"),
+        plain_line_cell("summary"),
+        plain_line_cell("after compact"),
+    ];
+    app.transcript_visible_start = 1;
+
+    let rendered = app.render_transcript_lines_for_reflow(/*width*/ 80);
+    let rendered_text = rendered
+        .lines
+        .iter()
+        .map(rendered_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(!rendered_text.contains("before compact"));
+    assert!(rendered_text.contains("summary"));
+    assert!(rendered_text.contains("after compact"));
+}
+
+#[tokio::test]
+async fn non_pending_rollback_counts_compaction_summary_turn() {
+    let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let summary = Arc::new(history_cell::new_context_compaction_summary(
+        Some("summary".to_string()),
+        app.chat_widget.config_ref().cwd.as_path(),
+    )) as Arc<dyn HistoryCell>;
+    app.transcript_cells = vec![
+        Arc::new(UserHistoryCell {
+            message: "first".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: Vec::new(),
+        }) as Arc<dyn HistoryCell>,
+        plain_line_cell("answer first"),
+        Arc::new(UserHistoryCell {
+            message: "second".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: Vec::new(),
+        }) as Arc<dyn HistoryCell>,
+        summary,
+        Arc::new(UserHistoryCell {
+            message: "after compact".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: Vec::new(),
+        }) as Arc<dyn HistoryCell>,
+    ];
+    app.transcript_visible_start = 3;
+
+    assert!(app.apply_non_pending_thread_rollback(2));
+
+    assert_eq!(user_count(&app.transcript_cells), 2);
+    assert_eq!(app.transcript_visible_start, 0);
+    assert_eq!(app.visible_transcript_cells().len(), 3);
+}
+
+#[tokio::test]
+async fn rollback_rebases_visible_start_to_previous_compaction_summary() {
+    let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let summary_1 = Arc::new(history_cell::new_context_compaction_summary(
+        Some("summary 1".to_string()),
+        app.chat_widget.config_ref().cwd.as_path(),
+    )) as Arc<dyn HistoryCell>;
+    let summary_2 = Arc::new(history_cell::new_context_compaction_summary(
+        Some("summary 2".to_string()),
+        app.chat_widget.config_ref().cwd.as_path(),
+    )) as Arc<dyn HistoryCell>;
+    app.transcript_cells = vec![
+        Arc::new(UserHistoryCell {
+            message: "first".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: Vec::new(),
+        }) as Arc<dyn HistoryCell>,
+        summary_1,
+        Arc::new(UserHistoryCell {
+            message: "between compactions".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: Vec::new(),
+        }) as Arc<dyn HistoryCell>,
+        summary_2,
+        Arc::new(UserHistoryCell {
+            message: "after second compact".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: Vec::new(),
+        }) as Arc<dyn HistoryCell>,
+    ];
+    app.transcript_visible_start = 3;
+
+    assert!(app.apply_non_pending_thread_rollback(2));
+
+    assert_eq!(app.transcript_visible_start, 1);
+    assert_eq!(app.visible_transcript_cells().len(), 2);
 }
 
 #[tokio::test]

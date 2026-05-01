@@ -411,8 +411,17 @@ impl App {
         };
 
         self.transcript_cells.remove(index);
+        self.invalidate_deferred_history_after_transcript_mutation();
+        if index < self.transcript_visible_start {
+            self.transcript_visible_start = self.transcript_visible_start.saturating_sub(1);
+        } else if index == self.transcript_visible_start {
+            self.transcript_visible_start =
+                crate::app_backtrack::latest_compaction_summary_position(&self.transcript_cells)
+                    .unwrap_or(0);
+        }
+        let cells = self.current_overlay_transcript_cells();
         if let Some(Overlay::Transcript(overlay)) = &mut self.overlay {
-            overlay.replace_cells(self.transcript_cells.clone());
+            overlay.replace_cells(cells);
         }
     }
 }

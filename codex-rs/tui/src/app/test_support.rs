@@ -27,6 +27,7 @@ pub(super) async fn make_test_app() -> App {
         runtime_permission_profile_override: None,
         file_search,
         transcript_cells: Vec::new(),
+        transcript_visible_start: 0,
         overlay: None,
         deferred_history_lines: Vec::new(),
         has_emitted_history_lines: false,

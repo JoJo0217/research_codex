@@ -49,7 +49,7 @@ impl App {
         }
     }
 
-    pub(super) fn clear_terminal_ui(
+    pub(crate) fn clear_terminal_ui(
         &mut self,
         tui: &mut tui::Tui,
         redraw_header: bool,
@@ -89,11 +89,41 @@ impl App {
     pub(super) fn reset_transcript_state_after_clear(&mut self) {
         self.overlay = None;
         self.transcript_cells.clear();
+        self.transcript_visible_start = 0;
         self.deferred_history_lines.clear();
         self.has_emitted_history_lines = false;
         self.transcript_reflow.clear();
         self.initial_history_replay_buffer = None;
         self.reset_backtrack_state_and_pending_restore();
         self.backtrack_render_pending = false;
+    }
+
+    pub(crate) fn record_compaction_summary_for_backtrack(&mut self, cell: Arc<dyn HistoryCell>) {
+        let had_initial_replay_buffer = self.initial_history_replay_buffer.is_some();
+        self.transcript_visible_start = self.transcript_cells.len();
+        self.transcript_cells.push(cell);
+        self.invalidate_deferred_history_after_transcript_mutation();
+        if had_initial_replay_buffer {
+            self.initial_history_replay_buffer = Some(Default::default());
+        }
+        self.transcript_reflow.clear();
+        self.reset_backtrack_state_after_compaction();
+    }
+
+    pub(crate) fn visible_transcript_cells(&self) -> &[Arc<dyn HistoryCell>] {
+        &self.transcript_cells[self
+            .transcript_visible_start
+            .min(self.transcript_cells.len())..]
+    }
+
+    pub(crate) fn current_overlay_transcript_cells(&self) -> Vec<Arc<dyn HistoryCell>> {
+        self.visible_transcript_cells().to_vec()
+    }
+
+    pub(crate) fn invalidate_deferred_history_after_transcript_mutation(&mut self) {
+        self.deferred_history_lines.clear();
+        if self.overlay.is_some() {
+            self.backtrack_render_pending = true;
+        }
     }
 }

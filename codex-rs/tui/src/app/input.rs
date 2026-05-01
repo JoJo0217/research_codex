@@ -126,7 +126,7 @@ impl App {
             // Enter alternate screen and set viewport to full size.
             let _ = tui.enter_alt_screen();
             self.overlay = Some(Overlay::new_transcript(
-                self.transcript_cells.clone(),
+                self.visible_transcript_cells().to_vec(),
                 self.keymap.pager.clone(),
             ));
             tui.frame_requester().schedule_frame();

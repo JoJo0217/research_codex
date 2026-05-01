@@ -540,6 +540,7 @@ impl TranscriptOverlay {
     /// transcript overlay immediately reflects the same committed cells as the main transcript.
     pub(crate) fn replace_cells(&mut self, cells: Vec<Arc<dyn HistoryCell>>) {
         let follow_bottom = self.view.is_scrolled_to_bottom();
+        let tail_renderable = self.take_live_tail_renderable();
         self.cells = cells;
         if self
             .highlight_cell
@@ -547,7 +548,10 @@ impl TranscriptOverlay {
         {
             self.highlight_cell = None;
         }
-        self.rebuild_renderables();
+        self.view.renderables = Self::render_cells(&self.cells, self.highlight_cell);
+        if let Some(tail) = tail_renderable {
+            self.view.renderables.push(tail);
+        }
         if follow_bottom {
             self.view.scroll_offset = usize::MAX;
         }
@@ -560,6 +564,7 @@ impl TranscriptOverlay {
     /// main transcript. The range is clamped defensively: cells may have been
     /// inserted after the overlay opened, leaving it with fewer entries than
     /// the main transcript.
+    #[cfg(test)]
     pub(crate) fn consolidate_cells(
         &mut self,
         range: std::ops::Range<usize>,
@@ -782,6 +787,16 @@ impl TranscriptOverlay {
     pub(crate) fn committed_cell_count(&self) -> usize {
         self.cells.len()
     }
+
+    #[cfg(test)]
+    pub(crate) fn renderable_count(&self) -> usize {
+        self.view.renderables.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn highlighted_cell(&self) -> Option<usize> {
+        self.highlight_cell
+    }
 }
 
 pub(crate) struct StaticOverlay {
@@ -963,6 +978,12 @@ mod tests {
         TranscriptOverlay::new(cells, default_pager_keymap())
     }
 
+    fn test_cell(text: &str) -> Arc<dyn HistoryCell> {
+        Arc::new(TestCell {
+            lines: vec![Line::from(text.to_string())],
+        }) as Arc<dyn HistoryCell>
+    }
+
     fn static_overlay(lines: Vec<Line<'static>>, title: &str) -> StaticOverlay {
         StaticOverlay::with_title(lines, title.to_string(), default_pager_keymap())
     }
@@ -978,6 +999,16 @@ mod tests {
             scroll_offset,
             default_pager_keymap(),
         )
+    }
+
+    #[test]
+    fn replace_cells_shrinking_does_not_preserve_stale_renderables() {
+        let mut overlay = transcript_overlay(vec![test_cell("old 1"), test_cell("old 2")]);
+
+        overlay.replace_cells(vec![test_cell("new")]);
+
+        assert_eq!(overlay.committed_cell_count(), 1);
+        assert_eq!(overlay.renderable_count(), 1);
     }
 
     #[test]
