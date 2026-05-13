@@ -17,6 +17,7 @@ use crate::protocol::v2::ThreadItem;
 use crate::protocol::v2::Turn;
 use crate::protocol::v2::TurnError as V2TurnError;
 use crate::protocol::v2::TurnError;
+use crate::protocol::v2::TurnItemsView;
 use crate::protocol::v2::TurnStatus;
 use crate::protocol::v2::UserInput;
 use crate::protocol::v2::WebSearchAction;
@@ -217,7 +218,6 @@ impl ThreadHistoryBuilder {
             EventMsg::Error(payload) => self.handle_error(payload),
             EventMsg::TokenCount(_) => {}
             EventMsg::ThreadRolledBack(payload) => self.handle_thread_rollback(payload),
-            EventMsg::UndoCompleted(_) => {}
             EventMsg::TurnAborted(payload) => self.handle_turn_aborted(payload),
             EventMsg::TurnStarted(payload) => self.handle_turn_started(payload),
             EventMsg::TurnComplete(payload) => self.handle_turn_complete(payload),
@@ -357,7 +357,10 @@ impl ThreadHistoryBuilder {
             | codex_protocol::items::TurnItem::AgentMessage(_)
             | codex_protocol::items::TurnItem::Reasoning(_)
             | codex_protocol::items::TurnItem::WebSearch(_)
+            | codex_protocol::items::TurnItem::ImageView(_)
             | codex_protocol::items::TurnItem::ImageGeneration(_)
+            | codex_protocol::items::TurnItem::FileChange(_)
+            | codex_protocol::items::TurnItem::McpToolCall(_)
             | codex_protocol::items::TurnItem::ContextCompaction(_) => {}
         }
     }
@@ -378,7 +381,10 @@ impl ThreadHistoryBuilder {
             | codex_protocol::items::TurnItem::AgentMessage(_)
             | codex_protocol::items::TurnItem::Reasoning(_)
             | codex_protocol::items::TurnItem::WebSearch(_)
+            | codex_protocol::items::TurnItem::ImageView(_)
             | codex_protocol::items::TurnItem::ImageGeneration(_)
+            | codex_protocol::items::TurnItem::FileChange(_)
+            | codex_protocol::items::TurnItem::McpToolCall(_)
             | codex_protocol::items::TurnItem::ContextCompaction(_) => {}
         }
     }
@@ -836,13 +842,7 @@ impl ThreadHistoryBuilder {
     }
 
     fn handle_context_compacted(&mut self, payload: &ContextCompactedEvent) {
-        let id = self.next_item_id();
-        self.ensure_turn()
-            .items
-            .push(ThreadItem::ContextCompaction {
-                id,
-                summary: payload.summary.clone(),
-            });
+        self.upsert_context_compaction_item(payload.summary.clone());
     }
 
     fn handle_entered_review_mode(&mut self, payload: &codex_protocol::protocol::ReviewRequest) {
@@ -968,8 +968,13 @@ impl ThreadHistoryBuilder {
     /// This keeps compaction-only legacy turns from being dropped by
     /// `finish_current_turn` when they have no renderable items and were not
     /// explicitly opened.
-    fn handle_compacted(&mut self, _payload: &CompactedItem) {
-        self.ensure_turn().saw_compaction = true;
+    fn handle_compacted(&mut self, payload: &CompactedItem) {
+        if payload.message.is_empty() {
+            self.ensure_turn().saw_compaction = true;
+            return;
+        }
+
+        self.upsert_context_compaction_item(Some(payload.message.clone()));
     }
 
     fn handle_thread_rollback(&mut self, payload: &ThreadRolledBackEvent) {
@@ -1052,6 +1057,28 @@ impl ThreadHistoryBuilder {
     fn upsert_item_in_current_turn(&mut self, item: ThreadItem) {
         let turn = self.ensure_turn();
         upsert_turn_item(&mut turn.items, item);
+    }
+
+    fn upsert_context_compaction_item(&mut self, summary: Option<String>) {
+        {
+            let turn = self.ensure_turn();
+            turn.saw_compaction = true;
+
+            if let Some(existing_summary) = turn.items.iter_mut().find_map(|item| match item {
+                ThreadItem::ContextCompaction { summary, .. } => Some(summary),
+                _ => None,
+            }) {
+                if existing_summary.is_none() {
+                    *existing_summary = summary;
+                }
+                return;
+            }
+        }
+
+        let id = self.next_item_id();
+        self.ensure_turn()
+            .items
+            .push(ThreadItem::ContextCompaction { id, summary });
     }
 
     fn next_item_id(&mut self) -> String {
@@ -1164,6 +1191,7 @@ impl From<PendingTurn> for Turn {
         Self {
             id: value.id,
             items: value.items,
+            items_view: TurnItemsView::Full,
             error: value.error,
             status: value.status,
             started_at: value.started_at,
@@ -1178,6 +1206,7 @@ impl From<&PendingTurn> for Turn {
         Self {
             id: value.id.clone(),
             items: value.items.clone(),
+            items_view: TurnItemsView::Full,
             error: value.error.clone(),
             status: value.status.clone(),
             started_at: value.started_at,
@@ -1354,6 +1383,7 @@ mod tests {
                     id: "user-item-id".to_string(),
                     content: Vec::new(),
                 }),
+                started_at_ms: 0,
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: turn_id.to_string(),
@@ -1450,6 +1480,7 @@ mod tests {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                items_view: TurnItemsView::Full,
                 items: vec![
                     ThreadItem::UserMessage {
                         id: "item-1".into(),
@@ -1818,6 +1849,7 @@ mod tests {
                 call_id: "exec-1".into(),
                 process_id: Some("pid-1".into()),
                 turn_id: "turn-1".into(),
+                completed_at_ms: 0,
                 command: vec!["echo".into(), "hello world".into()],
                 cwd: test_path_buf("/tmp").abs(),
                 parsed_cmd: vec![ParsedCommand::Unknown {
@@ -1981,6 +2013,7 @@ mod tests {
                 codex_protocol::dynamic_tools::DynamicToolCallRequest {
                     call_id: "dyn-1".into(),
                     turn_id: "turn-1".into(),
+                    started_at_ms: 0,
                     namespace: Some("codex_app".into()),
                     tool: "lookup_ticket".into(),
                     arguments: serde_json::json!({"id":"ABC-123"}),
@@ -1989,6 +2022,7 @@ mod tests {
             EventMsg::DynamicToolCallResponse(DynamicToolCallResponseEvent {
                 call_id: "dyn-1".into(),
                 turn_id: "turn-1".into(),
+                completed_at_ms: 0,
                 namespace: Some("codex_app".into()),
                 tool: "lookup_ticket".into(),
                 arguments: serde_json::json!({"id":"ABC-123"}),
@@ -2044,6 +2078,7 @@ mod tests {
                 call_id: "exec-declined".into(),
                 process_id: Some("pid-2".into()),
                 turn_id: "turn-1".into(),
+                completed_at_ms: 0,
                 command: vec!["ls".into()],
                 cwd: test_path_buf("/tmp").abs(),
                 parsed_cmd: vec![ParsedCommand::Unknown { cmd: "ls".into() }],
@@ -2132,6 +2167,8 @@ mod tests {
                 id: "review-guardian-exec".into(),
                 target_item_id: Some("guardian-exec".into()),
                 turn_id: "turn-1".into(),
+                started_at_ms: 1_000,
+                completed_at_ms: None,
                 status: GuardianAssessmentStatus::InProgress,
                 risk_level: None,
                 user_authorization: None,
@@ -2149,6 +2186,8 @@ mod tests {
                 id: "review-guardian-exec".into(),
                 target_item_id: Some("guardian-exec".into()),
                 turn_id: "turn-1".into(),
+                started_at_ms: 1_000,
+                completed_at_ms: Some(1_042),
                 status: GuardianAssessmentStatus::Denied,
                 risk_level: Some(codex_protocol::protocol::GuardianRiskLevel::High),
                 user_authorization: Some(codex_protocol::protocol::GuardianUserAuthorization::Low),
@@ -2211,6 +2250,8 @@ mod tests {
                 id: "review-guardian-execve".into(),
                 target_item_id: Some("guardian-execve".into()),
                 turn_id: "turn-1".into(),
+                started_at_ms: 2_000,
+                completed_at_ms: None,
                 status: GuardianAssessmentStatus::InProgress,
                 risk_level: None,
                 user_authorization: None,
@@ -2291,6 +2332,7 @@ mod tests {
                 call_id: "exec-late".into(),
                 process_id: Some("pid-42".into()),
                 turn_id: "turn-a".into(),
+                completed_at_ms: 0,
                 command: vec!["echo".into(), "done".into()],
                 cwd: test_path_buf("/tmp").abs(),
                 parsed_cmd: vec![ParsedCommand::Unknown {
@@ -2382,6 +2424,7 @@ mod tests {
                 call_id: "exec-unknown-turn".into(),
                 process_id: Some("pid-42".into()),
                 turn_id: "turn-missing".into(),
+                completed_at_ms: 0,
                 command: vec!["echo".into(), "done".into()],
                 cwd: test_path_buf("/tmp").abs(),
                 parsed_cmd: vec![ParsedCommand::Unknown {
@@ -2512,6 +2555,7 @@ mod tests {
             EventMsg::ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent {
                 call_id: "patch-call".into(),
                 turn_id: turn_id.to_string(),
+                started_at_ms: 0,
                 changes: [(
                     PathBuf::from("README.md"),
                     codex_protocol::protocol::FileChange::Add {
@@ -2714,7 +2758,77 @@ mod tests {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                items_view: TurnItemsView::Full,
                 items: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn restores_compaction_summary_from_rollout_marker() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-compact".into(),
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::Compacted(CompactedItem {
+                message: "summary text".into(),
+                replacement_history: None,
+            }),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-compact".into(),
+                last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].items,
+            vec![ThreadItem::ContextCompaction {
+                id: "item-0".into(),
+                summary: Some("summary text".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn merges_compaction_rollout_marker_and_legacy_event() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-compact".into(),
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::Compacted(CompactedItem {
+                message: "summary text".into(),
+                replacement_history: None,
+            }),
+            RolloutItem::EventMsg(EventMsg::ContextCompacted(ContextCompactedEvent {
+                summary: Some("summary text".into()),
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-compact".into(),
+                last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].items,
+            vec![ThreadItem::ContextCompaction {
+                id: "item-0".into(),
+                summary: Some("summary text".into()),
             }]
         );
     }
@@ -2730,6 +2844,7 @@ mod tests {
             }),
             EventMsg::CollabResumeEnd(codex_protocol::protocol::CollabResumeEndEvent {
                 call_id: "resume-1".into(),
+                completed_at_ms: 0,
                 sender_thread_id: ThreadId::try_from("00000000-0000-0000-0000-000000000001")
                     .expect("valid sender thread id"),
                 receiver_thread_id: ThreadId::try_from("00000000-0000-0000-0000-000000000002")
@@ -2786,6 +2901,7 @@ mod tests {
             }),
             EventMsg::CollabAgentSpawnEnd(codex_protocol::protocol::CollabAgentSpawnEndEvent {
                 call_id: "spawn-1".into(),
+                completed_at_ms: 0,
                 sender_thread_id,
                 new_thread_id: Some(spawned_thread_id),
                 new_agent_nickname: Some("Scout".into()),
@@ -2847,6 +2963,7 @@ mod tests {
             EventMsg::CollabAgentInteractionBegin(
                 codex_protocol::protocol::CollabAgentInteractionBeginEvent {
                     call_id: "send-1".into(),
+                    started_at_ms: 0,
                     sender_thread_id: sender,
                     receiver_thread_id: receiver,
                     prompt: "new task".into(),
@@ -2855,6 +2972,7 @@ mod tests {
             EventMsg::CollabAgentInteractionEnd(
                 codex_protocol::protocol::CollabAgentInteractionEndEvent {
                     call_id: "send-1".into(),
+                    completed_at_ms: 0,
                     sender_thread_id: sender,
                     receiver_thread_id: receiver,
                     receiver_agent_nickname: None,
@@ -2969,6 +3087,7 @@ mod tests {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                items_view: TurnItemsView::Full,
                 items: vec![ThreadItem::UserMessage {
                     id: "item-1".into(),
                     content: vec![UserInput::Text {

@@ -1,6 +1,7 @@
 use super::App;
-use crate::app_server_session::ThreadSessionState;
-use crate::read_session_model;
+use crate::session_resume::read_session_model;
+use crate::session_state::ThreadSessionState;
+use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::Thread;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ActivePermissionProfile;
@@ -14,7 +15,6 @@ impl App {
         cwd: AbsolutePathBuf,
     ) {
         self.config.cwd = cwd.clone();
-        self.file_search.update_search_dir(cwd.to_path_buf());
         self.chat_widget.set_runtime_cwd(cwd.clone());
         self.sync_thread_cwd_to_cached_session(thread_id, cwd.clone())
             .await;
@@ -43,12 +43,18 @@ impl App {
         if self.primary_thread_id == Some(thread_id)
             && let Some(session) = self.primary_session_configured.as_mut()
         {
+            if session.discovery_cwd.is_none() {
+                session.discovery_cwd = Some(session.cwd.clone());
+            }
             session.cwd = cwd.clone();
         }
 
         if let Some(channel) = self.thread_event_channels.get(&thread_id) {
             let mut store = channel.store.lock().await;
             if let Some(session) = store.session.as_mut() {
+                if session.discovery_cwd.is_none() {
+                    session.discovery_cwd = Some(session.cwd.clone());
+                }
                 session.cwd = cwd;
             }
         }
@@ -59,7 +65,7 @@ impl App {
             return;
         };
 
-        let approval_policy = self.config.permissions.approval_policy.value();
+        let approval_policy = AskForApproval::from(self.config.permissions.approval_policy.value());
         let approvals_reviewer = self.config.approvals_reviewer;
         let permission_profile = self
             .chat_widget
@@ -109,16 +115,21 @@ impl App {
                 thread_name: None,
                 model: self.chat_widget.current_model().to_string(),
                 model_provider_id: self.config.model_provider_id.clone(),
-                service_tier: self.chat_widget.current_service_tier(),
-                approval_policy: self.config.permissions.approval_policy.value(),
+                service_tier: self
+                    .chat_widget
+                    .current_service_tier()
+                    .map(|service_tier| service_tier.request_value().to_string()),
+                approval_policy: AskForApproval::from(
+                    self.config.permissions.approval_policy.value(),
+                ),
                 approvals_reviewer: self.config.approvals_reviewer,
                 permission_profile: permission_profile.clone(),
                 active_permission_profile: active_permission_profile.clone(),
                 cwd: thread.cwd.clone(),
+                discovery_cwd: None,
                 instruction_source_paths: Vec::new(),
                 reasoning_effort: self.chat_widget.current_reasoning_effort(),
-                history_log_id: 0,
-                history_entry_count: 0,
+                message_history: None,
                 network_proxy: None,
                 rollout_path: thread.path.clone(),
             });
@@ -126,19 +137,19 @@ impl App {
         session.thread_name = thread.name.clone();
         session.model_provider_id = thread.model_provider.clone();
         session.cwd = thread.cwd.clone();
+        session.discovery_cwd = None;
         session.permission_profile = permission_profile;
         session.active_permission_profile = active_permission_profile;
         session.instruction_source_paths = Vec::new();
         session.rollout_path = thread.path.clone();
         if let Some(model) =
-            read_session_model(&self.config, thread_id, thread.path.as_deref()).await
+            read_session_model(self.state_db.as_deref(), thread_id, thread.path.as_deref()).await
         {
             session.model = model;
         } else if thread.path.is_some() {
             session.model.clear();
         }
-        session.history_log_id = 0;
-        session.history_entry_count = 0;
+        session.message_history = None;
         session
     }
 
@@ -165,15 +176,16 @@ mod tests {
     use crate::app::thread_events::ThreadEventChannel;
     use crate::test_support::PathBufExt;
     use crate::test_support::test_path_buf;
+    use codex_app_server_protocol::AskForApproval;
+    use codex_app_server_protocol::FileSystemAccessMode;
+    use codex_app_server_protocol::FileSystemPath;
+    use codex_app_server_protocol::FileSystemSandboxEntry;
+    use codex_app_server_protocol::FileSystemSpecialPath;
+    use codex_app_server_protocol::PermissionProfile as AppServerPermissionProfile;
+    use codex_app_server_protocol::PermissionProfileFileSystemPermissions;
+    use codex_app_server_protocol::PermissionProfileNetworkPermissions;
     use codex_config::types::ApprovalsReviewer;
     use codex_protocol::models::PermissionProfile;
-    use codex_protocol::protocol::AskForApproval;
-    use codex_protocol::protocol::FileSystemAccessMode;
-    use codex_protocol::protocol::FileSystemPath;
-    use codex_protocol::protocol::FileSystemSandboxEntry;
-    use codex_protocol::protocol::FileSystemSandboxPolicy;
-    use codex_protocol::protocol::FileSystemSpecialPath;
-    use codex_protocol::protocol::NetworkSandboxPolicy;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
 
@@ -191,13 +203,71 @@ mod tests {
             permission_profile: PermissionProfile::read_only(),
             active_permission_profile: None,
             cwd: cwd.abs(),
+            discovery_cwd: None,
             instruction_source_paths: Vec::new(),
             reasoning_effort: None,
-            history_log_id: 0,
-            history_entry_count: 0,
+            message_history: None,
             network_proxy: None,
             rollout_path: Some(PathBuf::new()),
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_cwd_override_preserves_cached_discovery_cwd() {
+        let mut app = make_test_app().await;
+        let thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000400").expect("valid thread");
+        let discovery_cwd = test_path_buf("/tmp/project");
+        let runtime_cwd = test_path_buf("/tmp/project/subdir");
+        let session = test_thread_session(thread_id, discovery_cwd.clone());
+
+        app.primary_thread_id = Some(thread_id);
+        app.active_thread_id = Some(thread_id);
+        app.primary_session_configured = Some(session.clone());
+        app.thread_event_channels.insert(
+            thread_id,
+            ThreadEventChannel::new_with_session(/*capacity*/ 4, session.clone(), Vec::new()),
+        );
+        app.chat_widget.handle_thread_session(session);
+
+        app.apply_runtime_cwd_override(thread_id, runtime_cwd.clone().abs())
+            .await;
+
+        let primary_session = app
+            .primary_session_configured
+            .as_ref()
+            .expect("primary session");
+        assert_eq!(primary_session.cwd, runtime_cwd.clone().abs());
+        assert_eq!(
+            primary_session.discovery_cwd,
+            Some(discovery_cwd.clone().abs())
+        );
+
+        let cached_session = app
+            .thread_event_channels
+            .get(&thread_id)
+            .expect("thread channel")
+            .store
+            .lock()
+            .await
+            .session
+            .clone()
+            .expect("cached session");
+        assert_eq!(cached_session.cwd, runtime_cwd.clone().abs());
+        assert_eq!(
+            cached_session.discovery_cwd,
+            Some(discovery_cwd.clone().abs())
+        );
+
+        app.chat_widget.handle_thread_session(cached_session);
+        assert_eq!(
+            app.chat_widget.discovery_cwd().to_path_buf(),
+            discovery_cwd
+        );
+        assert_eq!(
+            app.chat_widget.config_ref().cwd.to_path_buf(),
+            runtime_cwd
+        );
     }
 
     #[tokio::test]
@@ -236,7 +306,7 @@ mod tests {
         app.side_threads
             .insert(side_thread_id, SideThreadState::new(main_thread_id));
         app.config.permissions.approval_policy =
-            codex_config::Constrained::allow_any(AskForApproval::OnRequest);
+            codex_config::Constrained::allow_any(AskForApproval::OnRequest.to_core());
         app.config.approvals_reviewer = ApprovalsReviewer::AutoReview;
         let expected_permission_profile = PermissionProfile::workspace_write();
         app.chat_widget.handle_thread_session(main_session.clone());
@@ -290,23 +360,27 @@ mod tests {
         let mut app = make_test_app().await;
         let thread_id =
             ThreadId::from_string("00000000-0000-0000-0000-000000000403").expect("valid thread");
-        let profile = PermissionProfile::from_runtime_permissions(
-            &FileSystemSandboxPolicy::restricted(vec![
-                FileSystemSandboxEntry {
-                    path: FileSystemPath::Special {
-                        value: FileSystemSpecialPath::Root,
+        let profile: PermissionProfile = AppServerPermissionProfile::Managed {
+            network: PermissionProfileNetworkPermissions { enabled: false },
+            file_system: PermissionProfileFileSystemPermissions::Restricted {
+                entries: vec![
+                    FileSystemSandboxEntry {
+                        path: FileSystemPath::Special {
+                            value: FileSystemSpecialPath::Root,
+                        },
+                        access: FileSystemAccessMode::Read,
                     },
-                    access: FileSystemAccessMode::Read,
-                },
-                FileSystemSandboxEntry {
-                    path: FileSystemPath::GlobPattern {
-                        pattern: "**/.env".to_string(),
+                    FileSystemSandboxEntry {
+                        path: FileSystemPath::GlobPattern {
+                            pattern: "**/.env".to_string(),
+                        },
+                        access: FileSystemAccessMode::None,
                     },
-                    access: FileSystemAccessMode::None,
-                },
-            ]),
-            NetworkSandboxPolicy::Restricted,
-        );
+                ],
+                glob_scan_max_depth: None,
+            },
+        }
+        .into();
         let session = ThreadSessionState {
             permission_profile: profile.clone(),
             ..test_thread_session(thread_id, test_path_buf("/tmp/main"))
@@ -321,7 +395,7 @@ mod tests {
         );
         app.chat_widget.handle_thread_session(session.clone());
         app.config.permissions.approval_policy =
-            codex_config::Constrained::allow_any(AskForApproval::OnRequest);
+            codex_config::Constrained::allow_any(AskForApproval::OnRequest.to_core());
 
         app.sync_active_thread_permission_settings_to_cached_session()
             .await;
@@ -361,6 +435,7 @@ mod tests {
         };
         let read_thread = Thread {
             id: read_thread_id.to_string(),
+            session_id: read_thread_id.to_string(),
             forked_from_id: None,
             preview: "read thread".to_string(),
             ephemeral: false,
@@ -372,6 +447,7 @@ mod tests {
             cwd: test_path_buf("/tmp/read").abs(),
             cli_version: "0.0.0".to_string(),
             source: codex_app_server_protocol::SessionSource::Unknown,
+            thread_source: None,
             agent_nickname: None,
             agent_role: None,
             git_info: None,

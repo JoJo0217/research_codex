@@ -10,6 +10,10 @@ import codex_app_server
 from codex_app_server import AppServerConfig, RunResult
 from codex_app_server.models import InitializeResponse
 from codex_app_server.api import AsyncCodex, AsyncThread, Codex, Thread
+from codex_app_server.generated.v2_all import ClientRequest
+from codex_app_server.generated.v2_all import ContextCompactionThreadItem
+from codex_app_server.generated.v2_all import ThreadRuntimeCwdUpdateRequest
+from codex_app_server.generated.v2_all import ThreadRuntimeCwdUpdateResponse
 
 
 def _keyword_only_names(fn: object) -> list[str]:
@@ -53,6 +57,25 @@ def test_package_includes_py_typed_marker() -> None:
     assert marker.is_file()
 
 
+def test_generated_protocol_includes_research_runtime_cwd_and_compaction_summary() -> None:
+    item = ContextCompactionThreadItem.model_validate(
+        {"id": "item_1", "type": "contextCompaction", "summary": "compacted"}
+    )
+    assert item.summary == "compacted"
+
+    request = ClientRequest.model_validate(
+        {
+            "id": 1,
+            "method": "thread/runtimeCwd/update",
+            "params": {"threadId": "thread_1", "cwd": "/tmp/project"},
+        }
+    ).root
+    assert isinstance(request, ThreadRuntimeCwdUpdateRequest)
+    assert request.params.thread_id == "thread_1"
+    assert request.params.cwd == "/tmp/project"
+    assert ThreadRuntimeCwdUpdateResponse.model_validate({}) is not None
+
+
 def test_generated_public_signatures_are_snake_case_and_typed() -> None:
     expected = {
         Codex.thread_start: [
@@ -65,7 +88,6 @@ def test_generated_public_signatures_are_snake_case_and_typed() -> None:
             "ephemeral",
             "model",
             "model_provider",
-            "permission_profile",
             "personality",
             "sandbox",
             "service_name",
@@ -91,10 +113,8 @@ def test_generated_public_signatures_are_snake_case_and_typed() -> None:
             "config",
             "cwd",
             "developer_instructions",
-            "exclude_turns",
             "model",
             "model_provider",
-            "permission_profile",
             "personality",
             "sandbox",
             "service_tier",
@@ -107,10 +127,8 @@ def test_generated_public_signatures_are_snake_case_and_typed() -> None:
             "cwd",
             "developer_instructions",
             "ephemeral",
-            "exclude_turns",
             "model",
             "model_provider",
-            "permission_profile",
             "sandbox",
             "service_tier",
         ],
@@ -121,7 +139,6 @@ def test_generated_public_signatures_are_snake_case_and_typed() -> None:
             "effort",
             "model",
             "output_schema",
-            "permission_profile",
             "personality",
             "sandbox_policy",
             "service_tier",
@@ -134,7 +151,6 @@ def test_generated_public_signatures_are_snake_case_and_typed() -> None:
             "effort",
             "model",
             "output_schema",
-            "permission_profile",
             "personality",
             "sandbox_policy",
             "service_tier",
@@ -150,7 +166,6 @@ def test_generated_public_signatures_are_snake_case_and_typed() -> None:
             "ephemeral",
             "model",
             "model_provider",
-            "permission_profile",
             "personality",
             "sandbox",
             "service_name",
@@ -176,10 +191,8 @@ def test_generated_public_signatures_are_snake_case_and_typed() -> None:
             "config",
             "cwd",
             "developer_instructions",
-            "exclude_turns",
             "model",
             "model_provider",
-            "permission_profile",
             "personality",
             "sandbox",
             "service_tier",
@@ -192,10 +205,8 @@ def test_generated_public_signatures_are_snake_case_and_typed() -> None:
             "cwd",
             "developer_instructions",
             "ephemeral",
-            "exclude_turns",
             "model",
             "model_provider",
-            "permission_profile",
             "sandbox",
             "service_tier",
         ],
@@ -206,7 +217,6 @@ def test_generated_public_signatures_are_snake_case_and_typed() -> None:
             "effort",
             "model",
             "output_schema",
-            "permission_profile",
             "personality",
             "sandbox_policy",
             "service_tier",
@@ -219,7 +229,6 @@ def test_generated_public_signatures_are_snake_case_and_typed() -> None:
             "effort",
             "model",
             "output_schema",
-            "permission_profile",
             "personality",
             "sandbox_policy",
             "service_tier",

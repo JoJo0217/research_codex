@@ -21,13 +21,9 @@ impl App {
     }
 
     pub(super) async fn refresh_in_memory_config_from_disk(&mut self) -> Result<()> {
-        let mut config = self
-            .rebuild_config_for_cwd(self.chat_widget.config_ref().cwd.to_path_buf())
-            .await?;
-        self.apply_runtime_policy_overrides(&mut config);
-        self.config = config;
-        self.chat_widget.sync_plugin_mentions_config(&self.config);
-        Ok(())
+        let discovery_cwd = self.chat_widget.discovery_cwd().to_path_buf();
+        self.refresh_in_memory_config_from_disk_for_discovery_cwd(discovery_cwd)
+            .await
     }
 
     pub(super) async fn refresh_in_memory_config_from_disk_for_discovery_cwd(
@@ -61,7 +57,7 @@ impl App {
         match self.rebuild_config_for_cwd(resume_cwd.clone()).await {
             Ok(config) => Ok(config),
             Err(err) => {
-                if crate::cwds_differ(current_cwd, &resume_cwd) {
+                if crate::session_resume::cwds_differ(current_cwd, &resume_cwd) {
                     Err(err)
                 } else {
                     let resume_cwd_display = resume_cwd.display().to_string();
@@ -78,7 +74,7 @@ impl App {
 
     pub(super) fn apply_runtime_policy_overrides(&mut self, config: &mut Config) {
         if let Some(policy) = self.runtime_approval_policy_override.as_ref()
-            && let Err(err) = config.permissions.approval_policy.set(*policy)
+            && let Err(err) = config.permissions.approval_policy.set(policy.to_core())
         {
             tracing::warn!(%err, "failed to carry forward approval policy override");
             self.chat_widget.add_error_message(format!(
@@ -107,7 +103,7 @@ impl App {
         user_message_prefix: &str,
         log_message: &str,
     ) -> bool {
-        if let Err(err) = config.permissions.approval_policy.set(policy) {
+        if let Err(err) = config.permissions.approval_policy.set(policy.to_core()) {
             tracing::warn!(error = %err, "{log_message}");
             self.chat_widget
                 .add_error_message(format!("{user_message_prefix}: {err}"));
@@ -216,7 +212,7 @@ impl App {
                 let previous_approvals_reviewer = feature_config.approvals_reviewer;
                 if effective_enabled {
                     // Persist the reviewer setting so future sessions keep the
-                    // experiment's matching `/approvals` mode until the user
+                    // experiment's matching `/permissions` mode until the user
                     // changes it explicitly.
                     feature_config.approvals_reviewer = auto_review_preset.approvals_reviewer;
                     feature_edits.push(ConfigEdit::SetPath {
@@ -307,8 +303,9 @@ impl App {
             self.set_approvals_reviewer_in_app_and_widget(self.config.approvals_reviewer);
         }
         if approval_policy_override.is_some() {
-            self.chat_widget
-                .set_approval_policy(self.config.permissions.approval_policy.value());
+            self.chat_widget.set_approval_policy(AskForApproval::from(
+                self.config.permissions.approval_policy.value(),
+            ));
         }
         if permission_profile_override.is_some()
             && let Err(err) = self
@@ -335,7 +332,7 @@ impl App {
                 .await;
             // This uses `OverrideTurnContext` intentionally: toggling the
             // experiment should update the active thread's effective approval
-            // settings immediately, just like a `/approvals` selection. Without
+            // settings immediately, just like a `/permissions` selection. Without
             // this runtime patch, the config edit would only affect future
             // sessions or turns recreated from disk.
             let op = AppCommand::override_turn_context(
@@ -506,7 +503,7 @@ impl App {
         (!model.starts_with("codex-auto-")).then(|| Self::reasoning_label(reasoning_effort))
     }
 
-    pub(crate) fn token_usage(&self) -> codex_protocol::protocol::TokenUsage {
+    pub(crate) fn token_usage(&self) -> crate::token_usage::TokenUsage {
         self.chat_widget.token_usage()
     }
 
@@ -561,9 +558,6 @@ mod tests {
     use crate::app::test_support::make_test_app;
     use crate::test_support::PathBufExt;
     use codex_protocol::models::PermissionProfile;
-    use codex_protocol::protocol::Event;
-    use codex_protocol::protocol::EventMsg;
-    use codex_protocol::protocol::SessionConfiguredEvent;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
@@ -641,17 +635,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_in_memory_config_from_disk_uses_active_chat_widget_cwd() -> Result<()> {
+    async fn refresh_in_memory_config_from_disk_uses_discovery_cwd_and_preserves_runtime_cwd()
+    -> Result<()> {
         let mut app = make_test_app().await;
-        let original_cwd = app.config.cwd.clone();
-        let next_cwd_tmp = tempdir()?;
-        let next_cwd = next_cwd_tmp.path().to_path_buf();
+        let discovery_cwd_tmp = tempdir()?;
+        let discovery_cwd = discovery_cwd_tmp.path().to_path_buf();
+        let runtime_cwd_tmp = tempdir()?;
+        let runtime_cwd = runtime_cwd_tmp.path().to_path_buf();
 
-        app.chat_widget.handle_codex_event(Event {
-            id: String::new(),
-            msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
-                session_id: ThreadId::new(),
+        app.chat_widget
+            .handle_thread_session(crate::session_state::ThreadSessionState {
+                thread_id: ThreadId::new(),
                 forked_from_id: None,
+                fork_parent_title: None,
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -660,22 +656,24 @@ mod tests {
                 approvals_reviewer: ApprovalsReviewer::User,
                 permission_profile: PermissionProfile::read_only(),
                 active_permission_profile: None,
-                cwd: next_cwd.clone().abs(),
+                cwd: discovery_cwd.clone().abs(),
+                discovery_cwd: None,
+                instruction_source_paths: Vec::new(),
                 reasoning_effort: None,
-                history_log_id: 0,
-                history_entry_count: 0,
-                initial_messages: None,
+                message_history: None,
                 network_proxy: None,
                 rollout_path: Some(PathBuf::new()),
-            }),
-        });
+            });
+        app.config.cwd = runtime_cwd.clone().abs();
+        app.chat_widget.set_runtime_cwd(runtime_cwd.clone().abs());
 
-        assert_eq!(app.chat_widget.config_ref().cwd.to_path_buf(), next_cwd);
-        assert_eq!(app.config.cwd, original_cwd);
+        assert_eq!(app.chat_widget.discovery_cwd().to_path_buf(), discovery_cwd);
+        assert_eq!(app.chat_widget.config_ref().cwd.to_path_buf(), runtime_cwd);
 
         app.refresh_in_memory_config_from_disk().await?;
 
         assert_eq!(app.config.cwd, app.chat_widget.config_ref().cwd);
+        assert_eq!(app.config.cwd.to_path_buf(), runtime_cwd);
         Ok(())
     }
 

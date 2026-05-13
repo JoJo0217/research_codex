@@ -24,6 +24,7 @@ use crate::session::turn_context::TurnContext;
 use crate::state::TaskKind;
 use crate::tools::format_exec_output_str;
 use crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot;
+use crate::turn_timing::now_unix_timestamp_ms;
 use crate::user_shell_command::user_shell_command_record_item;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
@@ -194,6 +195,7 @@ pub(crate) async fn execute_user_shell_command(
                 call_id: call_id.clone(),
                 process_id: None,
                 turn_id: turn_context.sub_id.clone(),
+                started_at_ms: now_unix_timestamp_ms(),
                 command: display_command.clone(),
                 cwd: cwd.clone(),
                 parsed_cmd: parsed_cmd.clone(),
@@ -266,6 +268,7 @@ pub(crate) async fn execute_user_shell_command(
                         call_id,
                         process_id: None,
                         turn_id: turn_context.sub_id.clone(),
+                        completed_at_ms: now_unix_timestamp_ms(),
                         command: display_command.clone(),
                         cwd: cwd.clone(),
                         parsed_cmd: parsed_cmd.clone(),
@@ -290,6 +293,7 @@ pub(crate) async fn execute_user_shell_command(
                         call_id: call_id.clone(),
                         process_id: None,
                         turn_id: turn_context.sub_id.clone(),
+                        completed_at_ms: now_unix_timestamp_ms(),
                         command: display_command.clone(),
                         cwd: cwd.clone(),
                         parsed_cmd: parsed_cmd.clone(),
@@ -334,6 +338,7 @@ pub(crate) async fn execute_user_shell_command(
                         call_id,
                         process_id: None,
                         turn_id: turn_context.sub_id.clone(),
+                        completed_at_ms: now_unix_timestamp_ms(),
                         command: display_command,
                         cwd,
                         parsed_cmd,
@@ -480,6 +485,7 @@ async fn send_cd_end(
                 call_id: call_id.to_string(),
                 process_id: None,
                 turn_id: turn_context.sub_id.clone(),
+                started_at_ms: now_unix_timestamp_ms(),
                 command: display_command.to_vec(),
                 cwd: turn_context.cwd.clone(),
                 parsed_cmd: parsed_cmd.to_vec(),
@@ -495,6 +501,7 @@ async fn send_cd_end(
                 call_id: call_id.to_string(),
                 process_id: None,
                 turn_id: turn_context.sub_id.clone(),
+                completed_at_ms: now_unix_timestamp_ms(),
                 command: display_command.to_vec(),
                 cwd,
                 parsed_cmd: parsed_cmd.to_vec(),

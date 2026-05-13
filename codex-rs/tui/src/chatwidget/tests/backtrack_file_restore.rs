@@ -127,35 +127,70 @@ fn apply_successful_patch_snapshot(
     path: &std::path::Path,
     after: &[u8],
 ) {
-    let mut changes = HashMap::new();
-    changes.insert(
-        path.to_path_buf(),
-        FileChange::Update {
-            unified_diff: String::new(),
-            move_path: None,
-        },
-    );
-    chat.on_patch_apply_begin(
-        PatchApplyBeginEvent {
-            call_id: call_id.to_string(),
-            turn_id: "turn".to_string(),
-            auto_approved: true,
-            changes: changes.clone(),
-        },
-        /*capture_snapshots*/ true,
-    );
+    let changes = file_update_changes(path);
+    start_file_change(chat, call_id, changes.clone(), /*from_replay*/ false);
     std::fs::write(path, after).unwrap();
-    chat.on_patch_apply_end(
-        PatchApplyEndEvent {
-            call_id: call_id.to_string(),
-            turn_id: "turn".to_string(),
-            stdout: String::new(),
-            stderr: String::new(),
-            success: true,
-            changes,
-            status: CorePatchApplyStatus::Completed,
-        },
-        /*finish_snapshots*/ true,
+    complete_file_change(
+        chat,
+        call_id,
+        changes,
+        AppServerPatchApplyStatus::Completed,
+        /*from_replay*/ false,
+    );
+}
+
+fn file_update_changes(path: &std::path::Path) -> Vec<FileUpdateChange> {
+    vec![FileUpdateChange {
+        path: path.to_string_lossy().to_string(),
+        kind: PatchChangeKind::Update { move_path: None },
+        diff: String::new(),
+    }]
+}
+
+fn replay_kind(from_replay: bool) -> Option<ReplayKind> {
+    from_replay.then_some(ReplayKind::ThreadSnapshot)
+}
+
+fn start_file_change(
+    chat: &mut ChatWidget,
+    call_id: &str,
+    changes: Vec<FileUpdateChange>,
+    from_replay: bool,
+) {
+    chat.handle_server_notification(
+        ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            started_at_ms: 0,
+            item: AppServerThreadItem::FileChange {
+                id: call_id.to_string(),
+                changes,
+                status: AppServerPatchApplyStatus::InProgress,
+            },
+        }),
+        replay_kind(from_replay),
+    );
+}
+
+fn complete_file_change(
+    chat: &mut ChatWidget,
+    call_id: &str,
+    changes: Vec<FileUpdateChange>,
+    status: AppServerPatchApplyStatus,
+    from_replay: bool,
+) {
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
+            item: AppServerThreadItem::FileChange {
+                id: call_id.to_string(),
+                changes,
+                status,
+            },
+        }),
+        replay_kind(from_replay),
     );
 }
 
@@ -243,37 +278,17 @@ async fn replayed_patch_events_do_not_create_file_restore_snapshots() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("note.txt");
     std::fs::write(&path, b"already patched").unwrap();
-    let mut changes = HashMap::new();
-    changes.insert(
-        path,
-        FileChange::Update {
-            unified_diff: String::new(),
-            move_path: None,
-        },
-    );
+    let changes = file_update_changes(&path);
 
     chat.visible_user_turn_count = 1;
-    chat.handle_codex_event_replay(Event {
-        id: "begin".to_string(),
-        msg: EventMsg::PatchApplyBegin(PatchApplyBeginEvent {
-            call_id: "patch-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            auto_approved: true,
-            changes: changes.clone(),
-        }),
-    });
-    chat.handle_codex_event_replay(Event {
-        id: "end".to_string(),
-        msg: EventMsg::PatchApplyEnd(PatchApplyEndEvent {
-            call_id: "patch-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            stdout: String::new(),
-            stderr: String::new(),
-            success: true,
-            changes,
-            status: CorePatchApplyStatus::Completed,
-        }),
-    });
+    start_file_change(&mut chat, "patch-1", changes.clone(), /*from_replay*/ true);
+    complete_file_change(
+        &mut chat,
+        "patch-1",
+        changes,
+        AppServerPatchApplyStatus::Completed,
+        /*from_replay*/ true,
+    );
 
     assert!(chat.pending_patch_snapshots.is_empty());
     assert!(chat.backtrack_file_snapshots.is_empty());
@@ -298,6 +313,7 @@ async fn live_app_server_file_change_snapshots_are_restorable() {
         ServerNotification::ItemStarted(ItemStartedNotification {
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            started_at_ms: 0,
             item: AppServerThreadItem::FileChange {
                 id: "patch-1".to_string(),
                 changes: changes.clone(),
@@ -311,6 +327,7 @@ async fn live_app_server_file_change_snapshots_are_restorable() {
         ServerNotification::ItemCompleted(ItemCompletedNotification {
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
             item: AppServerThreadItem::FileChange {
                 id: "patch-1".to_string(),
                 changes,
@@ -354,6 +371,7 @@ async fn app_server_approval_then_file_change_stays_unrestorable() {
         ServerNotification::ItemStarted(ItemStartedNotification {
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            started_at_ms: 0,
             item: AppServerThreadItem::FileChange {
                 id: "patch-approval".to_string(),
                 changes: changes.clone(),
@@ -367,6 +385,7 @@ async fn app_server_approval_then_file_change_stays_unrestorable() {
         ServerNotification::ItemCompleted(ItemCompletedNotification {
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
             item: AppServerThreadItem::FileChange {
                 id: "patch-approval".to_string(),
                 changes,
@@ -437,15 +456,7 @@ async fn failed_patch_marks_turn_unrestorable_instead_of_restoring_snapshot() {
     );
     std::fs::write(&path, b"partial").unwrap();
 
-    chat.finish_pending_patch_snapshots(&PatchApplyEndEvent {
-        call_id: "patch-1".to_string(),
-        turn_id: "turn-1".to_string(),
-        stdout: String::new(),
-        stderr: "failed after partial write".to_string(),
-        success: false,
-        changes: HashMap::new(),
-        status: CorePatchApplyStatus::Failed,
-    });
+    chat.finish_pending_patch_snapshots("patch-1", &AppServerPatchApplyStatus::Failed);
 
     chat.backtrack_file_snapshots
         .push(BacktrackFileTurnSnapshot {
@@ -475,15 +486,7 @@ async fn failed_patch_drops_snapshot_when_files_unchanged() {
         },
     );
 
-    chat.finish_pending_patch_snapshots(&PatchApplyEndEvent {
-        call_id: "patch-1".to_string(),
-        turn_id: "turn-1".to_string(),
-        stdout: String::new(),
-        stderr: "failed before write".to_string(),
-        success: false,
-        changes: HashMap::new(),
-        status: CorePatchApplyStatus::Failed,
-    });
+    chat.finish_pending_patch_snapshots("patch-1", &AppServerPatchApplyStatus::Failed);
 
     assert!(!chat.has_backtrack_file_snapshots_after(0));
 }
@@ -494,35 +497,20 @@ async fn approval_required_failed_patch_does_not_restore_external_changes() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("approval.txt");
     std::fs::write(&path, b"A").unwrap();
-    let mut changes = HashMap::new();
-    changes.insert(
-        path.clone(),
-        FileChange::Update {
-            unified_diff: String::new(),
-            move_path: None,
-        },
-    );
 
     chat.visible_user_turn_count = 1;
-    chat.on_patch_apply_begin(
-        PatchApplyBeginEvent {
+    chat.on_apply_patch_approval_request(
+        "request-1".to_string(),
+        ApplyPatchApprovalRequestEvent {
             call_id: "patch-approval".to_string(),
             turn_id: "turn-1".to_string(),
-            auto_approved: false,
-            changes,
+            changes: HashMap::new(),
+            reason: None,
+            grant_root: None,
         },
-        /*capture_snapshots*/ true,
     );
     std::fs::write(&path, b"B").unwrap();
-    chat.finish_pending_patch_snapshots(&PatchApplyEndEvent {
-        call_id: "patch-approval".to_string(),
-        turn_id: "turn-1".to_string(),
-        stdout: String::new(),
-        stderr: "failed after approval delay".to_string(),
-        success: false,
-        changes: HashMap::new(),
-        status: CorePatchApplyStatus::Failed,
-    });
+    chat.finish_pending_patch_snapshots("patch-approval", &AppServerPatchApplyStatus::Failed);
 
     assert!(!chat.has_backtrack_file_snapshots_after(0));
     assert_eq!(std::fs::read(&path).unwrap(), b"B");
@@ -541,15 +529,7 @@ async fn failed_patch_with_snapshot_error_marks_turn_unrestorable() {
             restorable: false,
         },
     );
-    chat.finish_pending_patch_snapshots(&PatchApplyEndEvent {
-        call_id: "patch-1".to_string(),
-        turn_id: "turn-1".to_string(),
-        stdout: String::new(),
-        stderr: "failed with unsnapshottable target".to_string(),
-        success: false,
-        changes: HashMap::new(),
-        status: CorePatchApplyStatus::Failed,
-    });
+    chat.finish_pending_patch_snapshots("patch-1", &AppServerPatchApplyStatus::Failed);
     chat.backtrack_file_snapshots
         .push(BacktrackFileTurnSnapshot {
             user_turn_count: 2,
