@@ -4,6 +4,7 @@ use super::App;
 use super::app_server_event_targets::ServerNotificationThreadTarget;
 use super::app_server_event_targets::server_notification_thread_target;
 use super::app_server_event_targets::server_request_thread_id;
+use super::thread_routing::ThreadRequestEnqueueResult;
 use crate::app_command::AppCommand;
 use crate::app_event::AppEvent;
 use crate::app_server_session::AppServerSession;
@@ -147,9 +148,10 @@ impl App {
         app_server_client: &AppServerSession,
         request: ServerRequest,
     ) {
-        if let Some(unsupported) = self
-            .pending_app_server_requests
-            .note_server_request(&request)
+        if let Some(unsupported) =
+            super::app_server_requests::PendingAppServerRequests::unsupported_server_request(
+                &request,
+            )
         {
             tracing::warn!(
                 request_id = ?unsupported.request_id,
@@ -172,18 +174,90 @@ impl App {
         }
 
         let Some(thread_id) = server_request_thread_id(&request) else {
-            tracing::warn!("ignoring threadless app-server request");
+            let message =
+                "Threadless app-server requests are not available in TUI yet.".to_string();
+            tracing::warn!(
+                request_id = ?request.id(),
+                "rejecting threadless app-server request"
+            );
+            self.chat_widget.add_error_message(message.clone());
+            if let Err(err) = self
+                .reject_app_server_request(app_server_client, request.id().clone(), message)
+                .await
+            {
+                tracing::warn!("{err}");
+            }
             return;
         };
 
+        if self.thread_is_closed_or_marked_closed(thread_id).await {
+            let message = format!("Thread {thread_id} is closed.");
+            tracing::warn!(
+                thread_id = %thread_id,
+                request_id = ?request.id(),
+                "rejecting app-server request for closed thread"
+            );
+            if let Err(err) = self
+                .reject_app_server_request(app_server_client, request.id().clone(), message)
+                .await
+            {
+                tracing::warn!("{err}");
+            }
+            return;
+        }
+
+        if let Some(unsupported) = self
+            .pending_app_server_requests
+            .note_server_request(thread_id, &request)
+        {
+            tracing::warn!(
+                request_id = ?unsupported.request_id,
+                message = unsupported.message,
+                "rejecting unsupported app-server request"
+            );
+            self.chat_widget
+                .add_error_message(unsupported.message.clone());
+            if let Err(err) = self
+                .reject_app_server_request(
+                    app_server_client,
+                    unsupported.request_id,
+                    unsupported.message,
+                )
+                .await
+            {
+                tracing::warn!("{err}");
+            }
+            return;
+        }
+
         let result =
             if self.primary_thread_id == Some(thread_id) || self.primary_thread_id.is_none() {
-                self.enqueue_primary_thread_request(request).await
+                self.enqueue_primary_thread_request(request.clone()).await
             } else {
-                self.enqueue_thread_request(thread_id, request).await
+                self.enqueue_thread_request(thread_id, request.clone())
+                    .await
             };
-        if let Err(err) = result {
-            tracing::warn!("failed to enqueue app-server request: {err}");
+        match result {
+            Ok(ThreadRequestEnqueueResult::Enqueued) => {}
+            Ok(ThreadRequestEnqueueResult::ThreadClosed) => {
+                let message = format!("Thread {thread_id} is closed.");
+                self.pending_app_server_requests
+                    .discard_server_request(request.id());
+                tracing::warn!(
+                    thread_id = %thread_id,
+                    request_id = ?request.id(),
+                    "rejecting app-server request for thread closed during enqueue"
+                );
+                if let Err(err) = self
+                    .reject_app_server_request(app_server_client, request.id().clone(), message)
+                    .await
+                {
+                    tracing::warn!("{err}");
+                }
+            }
+            Err(err) => {
+                tracing::warn!("failed to enqueue app-server request: {err}");
+            }
         }
     }
 }

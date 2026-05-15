@@ -409,6 +409,9 @@ pub enum Op {
     /// Use this when callers intentionally want to stop long-lived background shells.
     CleanBackgroundTerminals,
 
+    /// Terminate one running background terminal process for this thread.
+    TerminateBackgroundTerminal { process_id: i32 },
+
     /// Start a realtime conversation stream.
     RealtimeConversationStart(ConversationStartParams),
 
@@ -839,6 +842,7 @@ impl Op {
         match self {
             Self::Interrupt => "interrupt",
             Self::CleanBackgroundTerminals => "clean_background_terminals",
+            Self::TerminateBackgroundTerminal { .. } => "terminate_background_terminal",
             Self::RealtimeConversationStart(_) => "realtime_conversation_start",
             Self::RealtimeConversationAudio(_) => "realtime_conversation_audio",
             Self::RealtimeConversationText(_) => "realtime_conversation_text",

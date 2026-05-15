@@ -499,6 +499,148 @@ async fn reusing_completed_process_returns_unknown_process() -> anyhow::Result<(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_flight_write_stdin_returns_terminal_response_after_external_terminate()
+-> anyhow::Result<()> {
+    skip_if_sandbox!(Ok(()));
+
+    let (session, turn) = test_session_and_turn().await;
+
+    let open_shell = exec_command(
+        &session, &turn, "bash -i", /*yield_time_ms*/ 2_500, /*workdir*/ None,
+    )
+    .await?;
+    let process_id = open_shell.process_id.expect("expected process id");
+
+    let write_session = Arc::clone(&session);
+    let write_task = tokio::spawn(async move {
+        write_stdin(
+            &write_session,
+            process_id,
+            "sleep 10\n",
+            /*yield_time_ms*/ 1_000,
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        session
+            .services
+            .unified_exec_manager
+            .terminate_process(process_id)
+            .await,
+        "external terminate should remove the live process"
+    );
+
+    let response = write_task.await??;
+    assert_eq!(
+        response.process_id, None,
+        "externally terminated in-flight poll should be terminal"
+    );
+    assert_eq!(
+        response.event_call_id, "call",
+        "terminal response should keep the original exec call id"
+    );
+    assert!(
+        session
+            .services
+            .unified_exec_manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .is_empty(),
+        "external terminate should not leak process entries"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_flight_write_stdin_ignores_reused_process_id_after_external_terminate()
+-> anyhow::Result<()> {
+    skip_if_sandbox!(Ok(()));
+
+    let (session, turn) = test_session_and_turn().await;
+
+    let old_shell = exec_command(
+        &session, &turn, "bash -i", /*yield_time_ms*/ 2_500, /*workdir*/ None,
+    )
+    .await?;
+    let old_process_id = old_shell.process_id.expect("expected process id");
+
+    let replacement_shell = exec_command(
+        &session, &turn, "bash -i", /*yield_time_ms*/ 2_500, /*workdir*/ None,
+    )
+    .await?;
+    let replacement_process_id = replacement_shell.process_id.expect("expected process id");
+
+    let write_session = Arc::clone(&session);
+    let write_task = tokio::spawn(async move {
+        write_stdin(
+            &write_session,
+            old_process_id,
+            "sleep 10\n",
+            /*yield_time_ms*/ 1_000,
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let old_entry = {
+        let mut store = session
+            .services
+            .unified_exec_manager
+            .process_store
+            .lock()
+            .await;
+        let old_entry = store
+            .remove(old_process_id)
+            .expect("expected old process entry");
+        let mut replacement_entry = store
+            .remove(replacement_process_id)
+            .expect("expected replacement process entry");
+        replacement_entry.process_id = old_process_id;
+        store.reserved_process_ids.insert(old_process_id);
+        store.processes.insert(old_process_id, replacement_entry);
+        old_entry
+    };
+    old_entry.process.terminate();
+
+    let response = write_task.await??;
+    assert_eq!(
+        response.process_id, None,
+        "in-flight write should not report a reused process id as still alive"
+    );
+    assert_eq!(
+        response.event_call_id, "call",
+        "terminal response should keep the original exec call id"
+    );
+
+    assert!(
+        session
+            .services
+            .unified_exec_manager
+            .terminate_process(old_process_id)
+            .await,
+        "cleanup should terminate the replacement process under the reused id"
+    );
+    assert!(
+        session
+            .services
+            .unified_exec_manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .is_empty(),
+        "replacement cleanup should not leak process entries"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn completed_pipe_commands_preserve_exit_code() -> anyhow::Result<()> {
     let (_, turn) = make_session_and_context().await;
     let request = test_exec_request(

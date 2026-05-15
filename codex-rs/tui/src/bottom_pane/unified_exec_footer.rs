@@ -16,12 +16,14 @@ use crate::render::renderable::Renderable;
 /// Tracks active unified-exec processes and renders a compact summary.
 pub(crate) struct UnifiedExecFooter {
     processes: Vec<String>,
+    active_subagent_count: usize,
 }
 
 impl UnifiedExecFooter {
     pub(crate) fn new() -> Self {
         Self {
             processes: Vec::new(),
+            active_subagent_count: 0,
         }
     }
 
@@ -33,8 +35,16 @@ impl UnifiedExecFooter {
         true
     }
 
+    pub(crate) fn set_active_subagent_count(&mut self, count: usize) -> bool {
+        if self.active_subagent_count == count {
+            return false;
+        }
+        self.active_subagent_count = count;
+        true
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
-        self.processes.is_empty()
+        self.processes.is_empty() && self.active_subagent_count == 0
     }
 
     /// Returns the unindented summary text used by both footer and status-row rendering.
@@ -43,15 +53,24 @@ impl UnifiedExecFooter {
     /// callers can choose layout-specific framing (inline separator vs. row
     /// indentation). Returning `None` means there is nothing to surface.
     pub(crate) fn summary_text(&self) -> Option<String> {
-        if self.processes.is_empty() {
+        if self.processes.is_empty() && self.active_subagent_count == 0 {
             return None;
         }
 
-        let count = self.processes.len();
-        let plural = if count == 1 { "" } else { "s" };
-        Some(format!(
-            "{count} background terminal{plural} running · /ps to view · /stop to close"
-        ))
+        let mut parts = Vec::new();
+        if self.active_subagent_count > 0 {
+            let count = self.active_subagent_count;
+            let plural = if count == 1 { "" } else { "s" };
+            parts.push(format!("{count} subagent{plural} active · /agent to view"));
+        }
+        if !self.processes.is_empty() {
+            let count = self.processes.len();
+            let plural = if count == 1 { "" } else { "s" };
+            parts.push(format!(
+                "{count} background terminal{plural} running · ↓ to manage"
+            ));
+        }
+        Some(parts.join(" · "))
     }
 
     fn render_lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -91,6 +110,17 @@ mod tests {
     fn desired_height_empty() {
         let footer = UnifiedExecFooter::new();
         assert_eq!(footer.desired_height(/*width*/ 40), 0);
+    }
+
+    #[test]
+    fn render_active_subagents() {
+        let mut footer = UnifiedExecFooter::new();
+        footer.set_active_subagent_count(2);
+        let width = 50;
+        let height = footer.desired_height(width);
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
+        footer.render(Rect::new(0, 0, width, height), &mut buf);
+        assert_snapshot!("render_active_subagents", format!("{buf:?}"));
     }
 
     #[test]

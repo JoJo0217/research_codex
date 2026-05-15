@@ -361,6 +361,9 @@ async fn restore_thread_input_state_restores_pending_steers_without_downgrading_
         active_collaboration_mask: chat.active_collaboration_mask.clone(),
         task_running: false,
         agent_turn_running: false,
+        last_turn_id: None,
+        unified_exec_processes: Vec::new(),
+        background_tracking_only: false,
     }));
 
     assert_eq!(

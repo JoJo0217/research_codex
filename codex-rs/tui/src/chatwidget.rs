@@ -203,6 +203,9 @@ const MEMORIES_ENABLE_NOTICE: &str = "Memories will be enabled in the next sessi
 const PLAN_MODE_REASONING_SCOPE_TITLE: &str = "Apply reasoning change";
 const PLAN_MODE_REASONING_SCOPE_PLAN_ONLY: &str = "Apply to Plan mode override";
 const PLAN_MODE_REASONING_SCOPE_ALL_MODES: &str = "Apply to global default and Plan mode override";
+const ACTIVITY_DASHBOARD_VIEW_ID: &str = "activity_dashboard";
+const BACKGROUND_TERMINAL_DETAILS_VIEW_ID: &str = "background_terminal_details";
+const SUBAGENT_ACTIVITY_DETAILS_VIEW_ID: &str = "subagent_activity_details";
 const CONNECTORS_SELECTION_VIEW_ID: &str = "connectors-selection";
 const TUI_STUB_MESSAGE: &str = "Not available in TUI yet.";
 
@@ -261,6 +264,7 @@ use crate::app_event::WindowsSandboxEnableMode;
 use crate::app_event_sender::AppEventSender;
 use crate::auto_review_denials;
 use crate::auto_review_denials::RecentAutoReviewDenials;
+use crate::background_terminal_wakeup;
 use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::BottomPane;
 use crate::bottom_pane::BottomPaneParams;
@@ -387,11 +391,133 @@ struct RunningCommand {
     source: ExecCommandSource,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 struct UnifiedExecProcessSummary {
     key: String,
+    process_id: Option<String>,
     call_id: String,
     command_display: String,
     recent_chunks: Vec<String>,
+    turn_id: Option<String>,
+    started_at: Instant,
+    completion_wakeup_eligible: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BackgroundTerminalActivitySummary {
+    pub(crate) thread_id: ThreadId,
+    pub(crate) key: String,
+    pub(crate) process_id: Option<String>,
+    pub(crate) call_id: String,
+    pub(crate) command_display: String,
+    pub(crate) recent_chunks: Vec<String>,
+    pub(crate) started_at: Instant,
+}
+
+pub(crate) enum InactiveBackgroundTerminalCompletion {
+    Wakeup(String),
+    Handled,
+}
+
+impl UnifiedExecProcessSummary {
+    fn to_activity_summary(&self, thread_id: ThreadId) -> BackgroundTerminalActivitySummary {
+        BackgroundTerminalActivitySummary {
+            thread_id,
+            key: self.key.clone(),
+            process_id: self.process_id.clone(),
+            call_id: self.call_id.clone(),
+            command_display: self.command_display.clone(),
+            recent_chunks: self.recent_chunks.clone(),
+            started_at: self.started_at,
+        }
+    }
+
+    fn matches_process_id(&self, process_id: &str) -> bool {
+        self.process_id.as_deref() == Some(process_id) || self.key == process_id
+    }
+}
+
+impl BackgroundTerminalActivitySummary {
+    fn matches_process_id(&self, process_id: &str) -> bool {
+        self.process_id.as_deref() == Some(process_id) || self.key == process_id
+    }
+}
+
+fn track_unified_exec_process_start(
+    processes: &mut Vec<UnifiedExecProcessSummary>,
+    call_id: &str,
+    process_id: Option<&str>,
+    command: &str,
+    turn_id: Option<&str>,
+    completion_wakeup_eligible: bool,
+) {
+    let key = process_id.unwrap_or(call_id).to_string();
+    let command = split_command_string(command);
+    let command_display = strip_bash_lc_and_escape(&command);
+    if let Some(existing) = processes.iter_mut().find(|process| process.key == key) {
+        existing.call_id = call_id.to_string();
+        existing.process_id = process_id.map(str::to_string);
+        existing.command_display = command_display;
+        existing.turn_id = turn_id.map(str::to_string);
+        existing.completion_wakeup_eligible |= completion_wakeup_eligible;
+    } else {
+        processes.push(UnifiedExecProcessSummary {
+            key,
+            process_id: process_id.map(str::to_string),
+            call_id: call_id.to_string(),
+            command_display,
+            recent_chunks: Vec::new(),
+            turn_id: turn_id.map(str::to_string),
+            started_at: Instant::now(),
+            completion_wakeup_eligible,
+        });
+    }
+}
+
+fn mark_unified_exec_processes_turn_completed(
+    processes: &mut [UnifiedExecProcessSummary],
+    turn_id: &str,
+) {
+    for process in processes {
+        if process.turn_id.as_deref() == Some(turn_id) {
+            process.completion_wakeup_eligible = true;
+        }
+    }
+}
+
+fn track_unified_exec_output_chunk(
+    processes: &mut [UnifiedExecProcessSummary],
+    call_id: &str,
+    chunk: &[u8],
+) {
+    let Some(process) = processes
+        .iter_mut()
+        .find(|process| process.call_id == call_id)
+    else {
+        return;
+    };
+
+    let text = String::from_utf8_lossy(chunk);
+    for line in text
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+    {
+        process.recent_chunks.push(line.to_string());
+    }
+    const MAX_RECENT_BACKGROUND_OUTPUT_LINES: usize = 3;
+    if process.recent_chunks.len() > MAX_RECENT_BACKGROUND_OUTPUT_LINES {
+        let drain_count = process.recent_chunks.len() - MAX_RECENT_BACKGROUND_OUTPUT_LINES;
+        process.recent_chunks.drain(0..drain_count);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SubagentActivitySummary {
+    pub(crate) thread_id: ThreadId,
+    pub(crate) label: String,
+    pub(crate) is_closed: bool,
+    pub(crate) started_at: Instant,
 }
 
 struct UnifiedExecWaitState {
@@ -999,6 +1125,11 @@ pub(crate) struct ChatWidget {
     turn_sleep_inhibitor: SleepInhibitor,
     task_complete_pending: bool,
     unified_exec_processes: Vec<UnifiedExecProcessSummary>,
+    background_terminal_activity_summaries: Vec<BackgroundTerminalActivitySummary>,
+    subagent_activity_summaries: Vec<SubagentActivitySummary>,
+    active_background_terminal_details: Option<(ThreadId, String)>,
+    active_subagent_activity_details: Option<ThreadId>,
+    last_activity_view_refresh_at: Option<Instant>,
     /// Tracks whether codex-core currently considers an agent turn to be in progress.
     ///
     /// This is kept separate from `mcp_startup_status` so that MCP startup progress (or completion)
@@ -1346,6 +1477,232 @@ pub(crate) struct ThreadInputState {
     active_collaboration_mask: Option<CollaborationModeMask>,
     task_running: bool,
     agent_turn_running: bool,
+    last_turn_id: Option<String>,
+    unified_exec_processes: Vec<UnifiedExecProcessSummary>,
+    background_tracking_only: bool,
+}
+
+impl ThreadInputState {
+    pub(crate) fn background_tracking_only() -> Self {
+        Self {
+            composer: None,
+            pending_steers: VecDeque::new(),
+            pending_steer_history_records: VecDeque::new(),
+            pending_steer_compare_keys: VecDeque::new(),
+            rejected_steers_queue: VecDeque::new(),
+            rejected_steer_history_records: VecDeque::new(),
+            queued_user_messages: VecDeque::new(),
+            queued_user_message_history_records: VecDeque::new(),
+            user_turn_pending_start: false,
+            current_collaboration_mode: CollaborationMode {
+                mode: ModeKind::Default,
+                settings: Settings {
+                    model: DEFAULT_MODEL_DISPLAY_NAME.to_string(),
+                    reasoning_effort: None,
+                    developer_instructions: None,
+                },
+            },
+            active_collaboration_mask: None,
+            task_running: false,
+            agent_turn_running: false,
+            last_turn_id: None,
+            unified_exec_processes: Vec::new(),
+            background_tracking_only: true,
+        }
+    }
+
+    pub(crate) fn background_terminal_activity_summaries(
+        &self,
+        thread_id: ThreadId,
+    ) -> Vec<BackgroundTerminalActivitySummary> {
+        self.unified_exec_processes
+            .iter()
+            .map(|process| process.to_activity_summary(thread_id))
+            .collect()
+    }
+
+    pub(crate) fn track_background_terminal_start(
+        &mut self,
+        call_id: &str,
+        process_id: Option<&str>,
+        command: &str,
+        turn_id: Option<&str>,
+    ) {
+        track_unified_exec_process_start(
+            &mut self.unified_exec_processes,
+            call_id,
+            process_id,
+            command,
+            turn_id,
+            /*completion_wakeup_eligible*/ false,
+        );
+    }
+
+    pub(crate) fn mark_background_terminals_turn_completed(&mut self, turn_id: &str) {
+        mark_unified_exec_processes_turn_completed(&mut self.unified_exec_processes, turn_id);
+    }
+
+    pub(crate) fn track_background_terminal_output_chunk(&mut self, call_id: &str, chunk: &[u8]) {
+        track_unified_exec_output_chunk(&mut self.unified_exec_processes, call_id, chunk);
+    }
+
+    pub(crate) fn remove_background_terminal_process(
+        &mut self,
+        process_id: &str,
+    ) -> Option<String> {
+        let index = self
+            .unified_exec_processes
+            .iter()
+            .position(|process| process.matches_process_id(process_id))?;
+        Some(self.unified_exec_processes.remove(index).command_display)
+    }
+
+    pub(crate) fn background_terminal_call_id(&self, process_id: &str) -> Option<String> {
+        self.unified_exec_processes
+            .iter()
+            .find(|process| process.matches_process_id(process_id))
+            .map(|process| process.call_id.clone())
+    }
+
+    pub(crate) fn clear_background_terminal_processes(&mut self) {
+        self.unified_exec_processes.clear();
+    }
+
+    pub(crate) fn background_terminal_command_display(&self, process_id: &str) -> Option<String> {
+        self.unified_exec_processes
+            .iter()
+            .find(|process| process.matches_process_id(process_id))
+            .map(|process| process.command_display.clone())
+    }
+
+    pub(crate) fn take_inactive_background_terminal_completion_wakeup(
+        &mut self,
+        call_id: &str,
+        process_id: Option<&str>,
+        status: &codex_app_server_protocol::CommandExecutionStatus,
+        exit_code: Option<i32>,
+        output: &str,
+        _completion_turn_id: Option<&str>,
+        _active_turn_id: Option<&str>,
+    ) -> Option<InactiveBackgroundTerminalCompletion> {
+        let key = process_id.unwrap_or(call_id);
+        let Some(index) = self
+            .unified_exec_processes
+            .iter()
+            .position(|process| process.key == key)
+        else {
+            return None;
+        };
+        let process = self.unified_exec_processes.remove(index);
+        if !process.completion_wakeup_eligible {
+            return Some(InactiveBackgroundTerminalCompletion::Handled);
+        }
+
+        let text = background_terminal_wakeup::completion_prompt(
+            background_terminal_wakeup::BackgroundTerminalCompletion {
+                command_display: &process.command_display,
+                status,
+                exit_code,
+                output,
+            },
+        );
+        Some(InactiveBackgroundTerminalCompletion::Wakeup(text))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queue_inactive_background_terminal_completion_wakeup(
+        &mut self,
+        call_id: &str,
+        process_id: Option<&str>,
+        status: &codex_app_server_protocol::CommandExecutionStatus,
+        exit_code: Option<i32>,
+        output: &str,
+        completion_turn_id: Option<&str>,
+        active_turn_id: Option<&str>,
+    ) -> bool {
+        match self.take_inactive_background_terminal_completion_wakeup(
+            call_id,
+            process_id,
+            status,
+            exit_code,
+            output,
+            completion_turn_id,
+            active_turn_id,
+        ) {
+            Some(InactiveBackgroundTerminalCompletion::Wakeup(text)) => {
+                let history_record =
+                    UserMessageHistoryRecord::Override(UserMessageHistoryOverride {
+                        text: "Background terminal completed".to_string(),
+                        text_elements: Vec::new(),
+                    });
+                self.queued_user_messages
+                    .push_back(QueuedUserMessage::from(UserMessage::from(text)));
+                self.queued_user_message_history_records
+                    .push_back(history_record);
+                true
+            }
+            Some(InactiveBackgroundTerminalCompletion::Handled) => true,
+            None => false,
+        }
+    }
+
+    pub(crate) fn queue_background_terminal_completion_prompt_for_restore(&mut self, text: String) {
+        self.queued_user_messages
+            .push_back(QueuedUserMessage::from(UserMessage::from(text)));
+        self.queued_user_message_history_records
+            .push_back(UserMessageHistoryRecord::Override(
+                UserMessageHistoryOverride {
+                    text: "Background terminal completed".to_string(),
+                    text_elements: Vec::new(),
+                },
+            ));
+    }
+
+    pub(crate) fn take_queued_completion_wakeup_prompts(&mut self) -> Vec<String> {
+        let queued_messages = self.queued_user_messages.drain(..).collect::<Vec<_>>();
+        let mut history_records = self
+            .queued_user_message_history_records
+            .drain(..)
+            .collect::<Vec<_>>();
+        history_records.resize(
+            queued_messages.len(),
+            UserMessageHistoryRecord::UserMessageText,
+        );
+
+        let mut prompts = Vec::new();
+        for (queued_message, history_record) in queued_messages.into_iter().zip(history_records) {
+            let is_completion_wakeup = is_completion_wakeup_history(&history_record);
+            if is_completion_wakeup && queued_message.action == QueuedInputAction::Plain {
+                prompts.push(queued_message.user_message.text);
+            } else {
+                self.queued_user_messages.push_back(queued_message);
+                self.queued_user_message_history_records
+                    .push_back(history_record);
+            }
+        }
+        prompts
+    }
+
+    pub(crate) fn user_turn_pending_start(&self) -> bool {
+        self.user_turn_pending_start
+    }
+
+    pub(crate) fn mark_user_turn_pending_start_for_restore(&mut self) {
+        self.user_turn_pending_start = true;
+    }
+
+    pub(crate) fn clear_user_turn_pending_start_for_restore(&mut self) {
+        self.user_turn_pending_start = false;
+    }
+}
+
+fn is_completion_wakeup_history(history_record: &UserMessageHistoryRecord) -> bool {
+    matches!(
+        history_record,
+        UserMessageHistoryRecord::Override(history)
+            if history.text.starts_with("Background terminal completed")
+                || history.text.starts_with("Subagent completed")
+    )
 }
 
 impl From<String> for UserMessage {
@@ -2039,6 +2396,133 @@ impl ChatWidget {
     /// user actually looking at?" and the footer stack remains a pure renderer of that decision.
     pub(crate) fn set_active_agent_label(&mut self, active_agent_label: Option<String>) {
         self.bottom_pane.set_active_agent_label(active_agent_label);
+    }
+
+    /// Forwards the number of known open subagents into the bottom-pane activity summary.
+    pub(crate) fn set_active_subagent_count(&mut self, count: usize) {
+        self.bottom_pane.set_active_subagent_count(count);
+    }
+
+    /// Stores the lightweight subagent rows shown in the activity dashboard.
+    pub(crate) fn set_subagent_activity_summaries(
+        &mut self,
+        summaries: Vec<SubagentActivitySummary>,
+    ) {
+        self.subagent_activity_summaries = summaries;
+        self.refresh_activity_views_if_open();
+    }
+
+    pub(crate) fn current_background_terminal_activity_summaries(
+        &self,
+        thread_id: ThreadId,
+    ) -> Vec<BackgroundTerminalActivitySummary> {
+        self.unified_exec_processes
+            .iter()
+            .map(|process| process.to_activity_summary(thread_id))
+            .collect()
+    }
+
+    pub(crate) fn set_background_terminal_activity_summaries(
+        &mut self,
+        summaries: Vec<BackgroundTerminalActivitySummary>,
+    ) {
+        self.background_terminal_activity_summaries = summaries;
+        self.sync_background_terminal_activity_footer();
+    }
+
+    pub(crate) fn clear_background_terminals_after_clean(&mut self) {
+        self.unified_exec_processes.clear();
+        self.clear_background_terminal_activity_summaries_for_current_thread();
+        self.sync_unified_exec_footer();
+    }
+
+    pub(crate) fn remove_background_terminal_process(
+        &mut self,
+        process_id: &str,
+    ) -> Option<String> {
+        let index = self
+            .unified_exec_processes
+            .iter()
+            .position(|process| process.matches_process_id(process_id))?;
+        let process = self.unified_exec_processes.remove(index);
+        self.prune_background_terminal_activity_summaries_for_current_thread(&[
+            process.key.clone(),
+            process.call_id.clone(),
+            process.process_id.clone().unwrap_or_default(),
+        ]);
+        self.sync_unified_exec_footer();
+        Some(process.command_display)
+    }
+
+    pub(crate) fn background_terminal_call_id(&self, process_id: &str) -> Option<String> {
+        self.unified_exec_processes
+            .iter()
+            .find(|process| process.matches_process_id(process_id))
+            .map(|process| process.call_id.clone())
+    }
+
+    pub(crate) fn background_terminal_command_display(&self, process_id: &str) -> Option<String> {
+        self.unified_exec_processes
+            .iter()
+            .find(|process| process.matches_process_id(process_id))
+            .map(|process| process.command_display.clone())
+    }
+
+    pub(crate) fn mark_replayed_background_terminals_live(&mut self) {
+        for process in &mut self.unified_exec_processes {
+            let active_turn_id = self
+                .agent_turn_running
+                .then(|| self.last_turn_id.as_deref())
+                .flatten();
+            process.completion_wakeup_eligible = process.turn_id.as_deref() != active_turn_id;
+        }
+    }
+
+    fn visible_background_terminal_activity_summaries(
+        &self,
+    ) -> Vec<BackgroundTerminalActivitySummary> {
+        let Some(thread_id) = self.thread_id else {
+            return self.background_terminal_activity_summaries.clone();
+        };
+
+        let mut summaries: Vec<BackgroundTerminalActivitySummary> = self
+            .background_terminal_activity_summaries
+            .iter()
+            .filter(|summary| summary.thread_id != thread_id)
+            .cloned()
+            .collect();
+        summaries.extend(self.current_background_terminal_activity_summaries(thread_id));
+        summaries
+    }
+
+    fn clear_background_terminal_activity_summaries_for_current_thread(&mut self) {
+        let Some(thread_id) = self.thread_id else {
+            self.background_terminal_activity_summaries.clear();
+            return;
+        };
+        self.background_terminal_activity_summaries
+            .retain(|summary| summary.thread_id != thread_id);
+    }
+
+    fn prune_background_terminal_activity_summaries_for_current_thread(
+        &mut self,
+        process_identifiers: &[String],
+    ) {
+        let Some(thread_id) = self.thread_id else {
+            return;
+        };
+        self.background_terminal_activity_summaries
+            .retain(|summary| {
+                if summary.thread_id != thread_id {
+                    return true;
+                }
+                !process_identifiers.iter().any(|identifier| {
+                    !identifier.is_empty()
+                        && (summary.key == *identifier
+                            || summary.call_id == *identifier
+                            || summary.process_id.as_deref() == Some(identifier.as_str()))
+                })
+            });
     }
 
     /// Recomputes footer status-line content from config and current runtime state.
@@ -3499,20 +3983,26 @@ impl ChatWidget {
             active_collaboration_mask: self.active_collaboration_mask.clone(),
             task_running: self.bottom_pane.is_task_running(),
             agent_turn_running: self.agent_turn_running,
+            last_turn_id: self.last_turn_id.clone(),
+            unified_exec_processes: self.unified_exec_processes.clone(),
+            background_tracking_only: false,
         })
     }
 
     pub(crate) fn restore_thread_input_state(&mut self, input_state: Option<ThreadInputState>) {
         let restored_task_running = input_state.as_ref().is_some_and(|state| state.task_running);
         if let Some(input_state) = input_state {
-            self.current_collaboration_mode = input_state.current_collaboration_mode;
-            self.active_collaboration_mask = input_state.active_collaboration_mask;
-            self.agent_turn_running = input_state.agent_turn_running;
-            self.goal_status_active_turn_started_at =
-                self.agent_turn_running.then_some(Instant::now());
             self.user_turn_pending_start = input_state.user_turn_pending_start;
-            self.update_collaboration_mode_indicator();
-            self.refresh_model_dependent_surfaces();
+            if !input_state.background_tracking_only {
+                self.current_collaboration_mode = input_state.current_collaboration_mode;
+                self.active_collaboration_mask = input_state.active_collaboration_mask;
+                self.agent_turn_running = input_state.agent_turn_running;
+                self.goal_status_active_turn_started_at =
+                    self.agent_turn_running.then_some(Instant::now());
+                self.last_turn_id = input_state.last_turn_id;
+                self.update_collaboration_mode_indicator();
+                self.refresh_model_dependent_surfaces();
+            }
             if let Some(composer) = input_state.composer {
                 let local_image_paths = composer
                     .local_images
@@ -3573,9 +4063,11 @@ impl ChatWidget {
                 self.queued_user_messages.len(),
                 UserMessageHistoryRecord::UserMessageText,
             );
+            self.unified_exec_processes = input_state.unified_exec_processes;
         } else {
             self.agent_turn_running = false;
             self.goal_status_active_turn_started_at = None;
+            self.last_turn_id = None;
             self.user_turn_pending_start = false;
             self.pending_steers.clear();
             self.rejected_steers_queue.clear();
@@ -3590,7 +4082,9 @@ impl ChatWidget {
             self.bottom_pane.set_composer_pending_pastes(Vec::new());
             self.queued_user_messages.clear();
             self.queued_user_message_history_records.clear();
+            self.unified_exec_processes.clear();
         }
+        self.sync_unified_exec_footer();
         self.turn_sleep_inhibitor
             .set_turn_running(self.agent_turn_running);
         self.update_task_running_state();
@@ -3880,7 +4374,12 @@ impl ChatWidget {
         );
     }
 
-    fn on_command_execution_started(&mut self, item: ThreadItem) {
+    fn on_command_execution_started(
+        &mut self,
+        item: ThreadItem,
+        turn_id: Option<&str>,
+        _from_replay: bool,
+    ) {
         let ThreadItem::CommandExecution {
             id,
             command,
@@ -3896,7 +4395,13 @@ impl ChatWidget {
         self.flush_answer_stream_with_separator();
         if is_unified_exec_source(*source) {
             if *source == ExecCommandSource::UnifiedExecStartup {
-                self.track_unified_exec_process_begin(id, process_id.as_deref(), command);
+                self.track_unified_exec_process_begin(
+                    id,
+                    process_id.as_deref(),
+                    command,
+                    turn_id,
+                    /*completion_wakeup_eligible*/ false,
+                );
             }
             if !self.bottom_pane.is_task_running() {
                 return;
@@ -4108,10 +4613,16 @@ impl ChatWidget {
         let Some(pending) = self.pending_patch_snapshots.remove(call_id) else {
             return;
         };
-        if matches!(status, codex_app_server_protocol::PatchApplyStatus::Declined) {
+        if matches!(
+            status,
+            codex_app_server_protocol::PatchApplyStatus::Declined
+        ) {
             return;
         }
-        let completed = matches!(status, codex_app_server_protocol::PatchApplyStatus::Completed);
+        let completed = matches!(
+            status,
+            codex_app_server_protocol::PatchApplyStatus::Completed
+        );
         if !pending.restorable {
             self.backtrack_unrestorable_file_turns
                 .insert(pending.user_turn_count);
@@ -4154,11 +4665,14 @@ impl ChatWidget {
         }
     }
 
-    fn on_command_execution_completed(&mut self, item: ThreadItem) {
+    fn on_command_execution_completed(&mut self, item: ThreadItem, turn_id: Option<&str>) {
         let ThreadItem::CommandExecution {
             id,
             process_id,
             source,
+            status,
+            aggregated_output,
+            exit_code,
             ..
         } = &item
         else {
@@ -4173,7 +4687,27 @@ impl ChatWidget {
             {
                 self.flush_unified_exec_wait_streak();
             }
-            self.track_unified_exec_process_end(id, process_id.as_deref());
+            let completed_background_process =
+                self.track_unified_exec_process_end(id, process_id.as_deref());
+            if let Some(process) = completed_background_process {
+                if !process.completion_wakeup_eligible {
+                    // Current-turn exec completions are already part of the active response.
+                } else if self.can_submit_background_completion_wakeup_now() {
+                    self.submit_background_terminal_completion_wakeup(
+                        process,
+                        status,
+                        *exit_code,
+                        aggregated_output.as_deref().unwrap_or_default(),
+                    );
+                } else if self.should_queue_background_completion_wakeup(&process, turn_id) {
+                    self.queue_background_terminal_completion_wakeup(
+                        process,
+                        status,
+                        *exit_code,
+                        aggregated_output.as_deref().unwrap_or_default(),
+                    );
+                }
+            }
             if !self.bottom_pane.is_task_running() {
                 return;
             }
@@ -4190,72 +4724,625 @@ impl ChatWidget {
         call_id: &str,
         process_id: Option<&str>,
         command: &str,
+        turn_id: Option<&str>,
+        completion_wakeup_eligible: bool,
     ) {
-        let key = process_id.unwrap_or(call_id).to_string();
-        let command = split_command_string(command);
-        let command_display = strip_bash_lc_and_escape(&command);
-        if let Some(existing) = self
-            .unified_exec_processes
-            .iter_mut()
-            .find(|process| process.key == key)
-        {
-            existing.call_id = call_id.to_string();
-            existing.command_display = command_display;
-            existing.recent_chunks.clear();
-        } else {
-            self.unified_exec_processes.push(UnifiedExecProcessSummary {
-                key,
-                call_id: call_id.to_string(),
-                command_display,
-                recent_chunks: Vec::new(),
-            });
-        }
+        track_unified_exec_process_start(
+            &mut self.unified_exec_processes,
+            call_id,
+            process_id,
+            command,
+            turn_id,
+            completion_wakeup_eligible,
+        );
         self.sync_unified_exec_footer();
     }
 
-    fn track_unified_exec_process_end(&mut self, call_id: &str, process_id: Option<&str>) {
+    fn mark_unified_exec_processes_turn_completed(&mut self, turn_id: &str) {
+        mark_unified_exec_processes_turn_completed(&mut self.unified_exec_processes, turn_id);
+    }
+
+    fn track_unified_exec_process_end(
+        &mut self,
+        call_id: &str,
+        process_id: Option<&str>,
+    ) -> Option<UnifiedExecProcessSummary> {
         let key = process_id.unwrap_or(call_id);
-        let before = self.unified_exec_processes.len();
-        self.unified_exec_processes
-            .retain(|process| process.key != key);
-        if self.unified_exec_processes.len() != before {
+        let removed = self
+            .unified_exec_processes
+            .iter()
+            .position(|process| process.key == key)
+            .map(|idx| self.unified_exec_processes.remove(idx));
+        if removed.is_some() {
             self.sync_unified_exec_footer();
         }
+        removed
     }
 
     fn sync_unified_exec_footer(&mut self) {
+        if !self.background_terminal_activity_summaries.is_empty() {
+            self.sync_background_terminal_activity_footer();
+            return;
+        }
         let processes = self
             .unified_exec_processes
             .iter()
             .map(|process| process.command_display.clone())
             .collect();
         self.bottom_pane.set_unified_exec_processes(processes);
+        self.refresh_activity_views_if_open();
+    }
+
+    fn sync_background_terminal_activity_footer(&mut self) {
+        let processes = self
+            .background_terminal_activity_summaries
+            .iter()
+            .map(|process| process.command_display.clone())
+            .collect();
+        self.bottom_pane.set_unified_exec_processes(processes);
+        self.refresh_activity_views_if_open();
+    }
+
+    fn refresh_activity_views_if_open(&mut self) {
+        if let Some(selected_index) = self
+            .bottom_pane
+            .selected_index_for_active_view(ACTIVITY_DASHBOARD_VIEW_ID)
+        {
+            let _ = self.bottom_pane.replace_selection_view_if_active(
+                ACTIVITY_DASHBOARD_VIEW_ID,
+                self.activity_dashboard_params(Some(selected_index)),
+            );
+            self.last_activity_view_refresh_at = Some(Instant::now());
+            self.schedule_activity_view_refresh_if_open();
+            return;
+        }
+
+        if let Some(selected_index) = self
+            .bottom_pane
+            .selected_index_for_active_view(BACKGROUND_TERMINAL_DETAILS_VIEW_ID)
+        {
+            let params = self
+                .active_background_terminal_details
+                .as_ref()
+                .and_then(|(thread_id, process_id)| {
+                    self.background_terminal_details_params(
+                        *thread_id,
+                        process_id,
+                        Some(selected_index),
+                    )
+                })
+                .unwrap_or_else(|| self.activity_dashboard_params(None));
+            let _ = self
+                .bottom_pane
+                .replace_selection_view_if_active(BACKGROUND_TERMINAL_DETAILS_VIEW_ID, params);
+            if self
+                .bottom_pane
+                .selected_index_for_active_view(ACTIVITY_DASHBOARD_VIEW_ID)
+                .is_some()
+            {
+                self.active_background_terminal_details = None;
+            }
+            self.last_activity_view_refresh_at = Some(Instant::now());
+            self.schedule_activity_view_refresh_if_open();
+            return;
+        }
+
+        if let Some(selected_index) = self
+            .bottom_pane
+            .selected_index_for_active_view(SUBAGENT_ACTIVITY_DETAILS_VIEW_ID)
+        {
+            let params = self
+                .active_subagent_activity_details
+                .and_then(|thread_id| {
+                    self.subagent_activity_details_params(thread_id, Some(selected_index))
+                })
+                .unwrap_or_else(|| self.activity_dashboard_params(None));
+            let _ = self
+                .bottom_pane
+                .replace_selection_view_if_active(SUBAGENT_ACTIVITY_DETAILS_VIEW_ID, params);
+            if self
+                .bottom_pane
+                .selected_index_for_active_view(ACTIVITY_DASHBOARD_VIEW_ID)
+                .is_some()
+            {
+                self.active_subagent_activity_details = None;
+            }
+            self.last_activity_view_refresh_at = Some(Instant::now());
+            self.schedule_activity_view_refresh_if_open();
+            return;
+        }
+        self.last_activity_view_refresh_at = None;
+    }
+
+    fn activity_view_is_open(&self) -> bool {
+        self.bottom_pane
+            .selected_index_for_active_view(ACTIVITY_DASHBOARD_VIEW_ID)
+            .is_some()
+            || self
+                .bottom_pane
+                .selected_index_for_active_view(BACKGROUND_TERMINAL_DETAILS_VIEW_ID)
+                .is_some()
+            || self
+                .bottom_pane
+                .selected_index_for_active_view(SUBAGENT_ACTIVITY_DETAILS_VIEW_ID)
+                .is_some()
+    }
+
+    fn schedule_activity_view_refresh_if_open(&self) {
+        if self.activity_view_is_open() {
+            self.frame_requester
+                .schedule_frame_in(Duration::from_secs(1));
+        }
+    }
+
+    fn refresh_activity_views_for_time_tick(&mut self) {
+        if !self.activity_view_is_open() {
+            self.last_activity_view_refresh_at = None;
+            return;
+        }
+        let now = Instant::now();
+        let interval = Duration::from_secs(1);
+        if let Some(last_refresh) = self.last_activity_view_refresh_at {
+            let elapsed = now.saturating_duration_since(last_refresh);
+            if elapsed < interval {
+                self.frame_requester.schedule_frame_in(interval - elapsed);
+                return;
+            }
+        }
+        self.refresh_activity_views_if_open();
+    }
+
+    fn can_submit_background_completion_wakeup_now(&self) -> bool {
+        !self.user_turn_pending_start
+            && !self.agent_turn_running
+            && self.mcp_startup_status.is_none()
+    }
+
+    fn should_queue_background_completion_wakeup(
+        &self,
+        process: &UnifiedExecProcessSummary,
+        completion_turn_id: Option<&str>,
+    ) -> bool {
+        if self.agent_turn_running {
+            let active_turn_id = self.last_turn_id.as_deref().or(completion_turn_id);
+            return process.turn_id.as_deref() != active_turn_id;
+        }
+
+        self.user_turn_pending_start || self.mcp_startup_status.is_some()
+    }
+
+    fn background_terminal_completion_wakeup_message(
+        process: UnifiedExecProcessSummary,
+        status: &codex_app_server_protocol::CommandExecutionStatus,
+        exit_code: Option<i32>,
+        output: &str,
+    ) -> (UserMessage, UserMessageHistoryRecord) {
+        let text = background_terminal_wakeup::completion_prompt(
+            background_terminal_wakeup::BackgroundTerminalCompletion {
+                command_display: &process.command_display,
+                status,
+                exit_code,
+                output,
+            },
+        );
+        let history_text = format!("Background terminal completed: {}", process.command_display);
+        let user_message = UserMessage {
+            text,
+            local_images: Vec::new(),
+            remote_image_urls: Vec::new(),
+            text_elements: Vec::new(),
+            mention_bindings: Vec::new(),
+        };
+        let history_record = UserMessageHistoryRecord::Override(UserMessageHistoryOverride {
+            text: history_text,
+            text_elements: Vec::new(),
+        });
+        (user_message, history_record)
+    }
+
+    fn submit_background_terminal_completion_wakeup(
+        &mut self,
+        process: UnifiedExecProcessSummary,
+        status: &codex_app_server_protocol::CommandExecutionStatus,
+        exit_code: Option<i32>,
+        output: &str,
+    ) {
+        let (user_message, history_record) =
+            Self::background_terminal_completion_wakeup_message(process, status, exit_code, output);
+        let Some(thread_id) = self.thread_id else {
+            self.queued_user_messages
+                .push_back(QueuedUserMessage::from(user_message));
+            self.queued_user_message_history_records
+                .push_back(history_record);
+            self.refresh_pending_input_preview();
+            return;
+        };
+        self.submit_plain_wakeup_to_thread(thread_id, user_message, history_record);
+    }
+
+    fn queue_background_terminal_completion_wakeup(
+        &mut self,
+        process: UnifiedExecProcessSummary,
+        status: &codex_app_server_protocol::CommandExecutionStatus,
+        exit_code: Option<i32>,
+        output: &str,
+    ) {
+        let (user_message, history_record) =
+            Self::background_terminal_completion_wakeup_message(process, status, exit_code, output);
+        self.queued_user_messages
+            .push_back(QueuedUserMessage::from(user_message));
+        self.queued_user_message_history_records
+            .push_back(history_record);
+        self.refresh_pending_input_preview();
+    }
+
+    fn subagent_completion_wakeup_message(
+        label: String,
+        thread_id: ThreadId,
+    ) -> (UserMessage, UserMessageHistoryRecord) {
+        let text = format!(
+            "Subagent completed.\n\nAgent: {label}\nThread: {thread_id}\n\nContinue from this subagent result. Inspect the subagent transcript if needed before taking further action."
+        );
+        let user_message = UserMessage {
+            text,
+            local_images: Vec::new(),
+            remote_image_urls: Vec::new(),
+            text_elements: Vec::new(),
+            mention_bindings: Vec::new(),
+        };
+        let history_record = UserMessageHistoryRecord::Override(UserMessageHistoryOverride {
+            text: format!("Subagent completed: {label}"),
+            text_elements: Vec::new(),
+        });
+        (user_message, history_record)
+    }
+
+    pub(crate) fn submit_subagent_completion_wakeup(&mut self, label: String, thread_id: ThreadId) {
+        let (user_message, history_record) =
+            Self::subagent_completion_wakeup_message(label, thread_id);
+        if self.can_submit_background_completion_wakeup_now() {
+            let Some(target_thread_id) = self.thread_id else {
+                self.queued_user_messages
+                    .push_back(QueuedUserMessage::from(user_message));
+                self.queued_user_message_history_records
+                    .push_back(history_record);
+                self.refresh_pending_input_preview();
+                return;
+            };
+            self.submit_plain_wakeup_to_thread(target_thread_id, user_message, history_record);
+        } else {
+            self.queued_user_messages
+                .push_back(QueuedUserMessage::from(user_message));
+            self.queued_user_message_history_records
+                .push_back(history_record);
+            self.refresh_pending_input_preview();
+        }
+    }
+
+    fn activity_elapsed_label(started_at: Instant) -> String {
+        let elapsed = started_at.elapsed();
+        let total_secs = elapsed.as_secs();
+        let hours = total_secs / 3600;
+        let minutes = (total_secs % 3600) / 60;
+        let seconds = total_secs % 60;
+        if hours > 0 {
+            format!("{hours}h {minutes:02}m")
+        } else if minutes > 0 {
+            format!("{minutes}m {seconds:02}s")
+        } else {
+            format!("{seconds}s")
+        }
+    }
+
+    pub(crate) fn open_activity_dashboard(&mut self) {
+        self.active_background_terminal_details = None;
+        self.active_subagent_activity_details = None;
+        self.bottom_pane
+            .show_selection_view(self.activity_dashboard_params(None));
+        self.schedule_activity_view_refresh_if_open();
+    }
+
+    fn activity_dashboard_params(
+        &self,
+        initial_selected_idx: Option<usize>,
+    ) -> SelectionViewParams {
+        let mut items: Vec<SelectionItem> = Vec::new();
+        let background_terminals = self.visible_background_terminal_activity_summaries();
+        for process in &background_terminals {
+            let process_id = process
+                .process_id
+                .clone()
+                .unwrap_or_else(|| process.key.clone());
+            let thread_id = process.thread_id;
+            let last_output = process.recent_chunks.last().map_or_else(
+                || "no output yet".to_string(),
+                |chunk| truncate_text(chunk, 80),
+            );
+            let description = Some(format!(
+                "Terminal · running {} · {last_output}",
+                Self::activity_elapsed_label(process.started_at),
+            ));
+            let action: SelectionAction = Box::new(move |tx| {
+                tx.send(AppEvent::OpenBackgroundTerminalDetails {
+                    thread_id,
+                    process_id: process_id.clone(),
+                });
+            });
+            items.push(SelectionItem {
+                name: process.command_display.clone(),
+                name_prefix_spans: vec!["•".green(), " ".into()],
+                description,
+                actions: vec![action],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+        for subagent in &self.subagent_activity_summaries {
+            let thread_id = subagent.thread_id;
+            let status = if subagent.is_closed {
+                "complete"
+            } else {
+                "running"
+            };
+            let description = Some(format!(
+                "Subagent · {status} {} · {}",
+                Self::activity_elapsed_label(subagent.started_at),
+                subagent.thread_id,
+            ));
+            let action: SelectionAction = Box::new(move |tx| {
+                tx.send(AppEvent::OpenSubagentActivityDetails { thread_id });
+            });
+            items.push(SelectionItem {
+                name: subagent.label.clone(),
+                name_prefix_spans: multi_agents::agent_picker_status_dot_spans(subagent.is_closed),
+                description,
+                actions: vec![action],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+        if items.is_empty() {
+            items.push(SelectionItem {
+                name: "No active background work".to_string(),
+                description: Some(
+                    "Subagents and background terminals will appear here.".to_string(),
+                ),
+                is_disabled: true,
+                ..Default::default()
+            });
+        }
+
+        SelectionViewParams {
+            view_id: Some(ACTIVITY_DASHBOARD_VIEW_ID),
+            title: Some("Activity".to_string()),
+            subtitle: Some(
+                "Select a task to view status, recent output, or stop actions.".to_string(),
+            ),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            initial_selected_idx,
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn open_background_terminal_details(
+        &mut self,
+        thread_id: ThreadId,
+        process_id: String,
+    ) {
+        let Some(params) = self.background_terminal_details_params(thread_id, &process_id, None)
+        else {
+            self.add_error_message("Background terminal is no longer running.".to_string());
+            return;
+        };
+        self.active_background_terminal_details = Some((thread_id, process_id));
+        self.bottom_pane.show_selection_view(params);
+        self.schedule_activity_view_refresh_if_open();
+    }
+
+    fn background_terminal_details_params(
+        &self,
+        thread_id: ThreadId,
+        process_id: &str,
+        initial_selected_idx: Option<usize>,
+    ) -> Option<SelectionViewParams> {
+        let background_terminals = self.visible_background_terminal_activity_summaries();
+        let Some(process) = background_terminals
+            .iter()
+            .find(|process| {
+                process.thread_id == thread_id && process.matches_process_id(process_id)
+            })
+            .cloned()
+        else {
+            return None;
+        };
+
+        let mut lines: Vec<Line<'static>> = vec![
+            Line::from(vec!["Status: ".bold(), "running".green()]),
+            Line::from(vec![
+                "Elapsed: ".bold(),
+                Self::activity_elapsed_label(process.started_at).into(),
+            ]),
+            Line::from(vec![
+                "Process: ".bold(),
+                process
+                    .process_id
+                    .clone()
+                    .unwrap_or_else(|| "unavailable".to_string())
+                    .into(),
+            ]),
+            Line::from(""),
+            Line::from("Recent output".bold()),
+        ];
+        if process.recent_chunks.is_empty() {
+            lines.push(Line::from("  No output captured yet."));
+        } else {
+            for chunk in &process.recent_chunks {
+                lines.push(Line::from(format!("  {}", truncate_text(chunk, 160))));
+            }
+        }
+
+        let details = history_cell::UnifiedExecProcessDetails {
+            command_display: process.command_display.clone(),
+            recent_chunks: process.recent_chunks.clone(),
+        };
+        let details_for_action = details.clone();
+        let append_action: SelectionAction = Box::new(move |tx| {
+            tx.send(AppEvent::InsertHistoryCell(Box::new(
+                history_cell::new_unified_exec_processes_output(vec![details_for_action.clone()]),
+            )));
+        });
+
+        let mut stop_item = SelectionItem {
+            name: "Stop terminal".to_string(),
+            description: Some("Terminate this background process.".to_string()),
+            dismiss_on_select: true,
+            ..Default::default()
+        };
+        if let Some(process_id) = process.process_id.clone() {
+            let thread_id = process.thread_id;
+            stop_item.actions.push(Box::new(move |tx| {
+                tx.send(AppEvent::StopBackgroundTerminal {
+                    thread_id,
+                    process_id: process_id.clone(),
+                });
+            }));
+        } else {
+            stop_item.is_disabled = true;
+            stop_item.disabled_reason =
+                Some("No process id was reported for this terminal.".to_string());
+        }
+
+        let back_action: SelectionAction = Box::new(|tx| {
+            tx.send(AppEvent::OpenActivityDashboard);
+        });
+        Some(SelectionViewParams {
+            view_id: Some(BACKGROUND_TERMINAL_DETAILS_VIEW_ID),
+            title: Some("Background Terminal".to_string()),
+            subtitle: Some(process.command_display),
+            header: Box::new(Paragraph::new(lines).wrap(Wrap { trim: false })),
+            footer_hint: Some(standard_popup_hint_line()),
+            items: vec![
+                SelectionItem {
+                    name: "Append recent output".to_string(),
+                    description: Some("Add the captured tail to the transcript.".to_string()),
+                    actions: vec![append_action],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+                stop_item,
+                SelectionItem {
+                    name: "Back to activity".to_string(),
+                    actions: vec![back_action],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+            ],
+            initial_selected_idx,
+            ..Default::default()
+        })
+    }
+
+    pub(crate) fn open_subagent_activity_details(&mut self, thread_id: ThreadId) {
+        let Some(params) = self.subagent_activity_details_params(thread_id, None) else {
+            self.add_error_message("Subagent is no longer available.".to_string());
+            return;
+        };
+        self.active_subagent_activity_details = Some(thread_id);
+        self.bottom_pane.show_selection_view(params);
+        self.schedule_activity_view_refresh_if_open();
+    }
+
+    fn subagent_activity_details_params(
+        &self,
+        thread_id: ThreadId,
+        initial_selected_idx: Option<usize>,
+    ) -> Option<SelectionViewParams> {
+        let Some(subagent) = self
+            .subagent_activity_summaries
+            .iter()
+            .find(|summary| summary.thread_id == thread_id)
+            .cloned()
+        else {
+            return None;
+        };
+        let status_text = if subagent.is_closed {
+            "complete"
+        } else {
+            "running"
+        };
+        let status_span: ratatui::text::Span<'static> = if subagent.is_closed {
+            status_text.into()
+        } else {
+            status_text.green()
+        };
+        let lines: Vec<Line<'static>> = vec![
+            Line::from(vec!["Status: ".bold(), status_span]),
+            Line::from(vec![
+                "Elapsed: ".bold(),
+                Self::activity_elapsed_label(subagent.started_at).into(),
+            ]),
+            Line::from(vec![
+                "Thread: ".bold(),
+                subagent.thread_id.to_string().into(),
+            ]),
+        ];
+        let open_thread_id = subagent.thread_id;
+        let open_action: SelectionAction = Box::new(move |tx| {
+            tx.send(AppEvent::SelectAgentThread(open_thread_id));
+        });
+        let interrupt_thread_id = subagent.thread_id;
+        let mut interrupt_item = SelectionItem {
+            name: "Interrupt subagent".to_string(),
+            description: Some("Stop the current turn for this subagent.".to_string()),
+            dismiss_on_select: true,
+            ..Default::default()
+        };
+        if subagent.is_closed {
+            interrupt_item.is_disabled = true;
+            interrupt_item.disabled_reason = Some("This subagent is already complete.".to_string());
+        } else {
+            interrupt_item.actions.push(Box::new(move |tx| {
+                tx.send(AppEvent::SubmitThreadOp {
+                    thread_id: interrupt_thread_id,
+                    op: AppCommand::interrupt(),
+                });
+            }));
+        }
+        let back_action: SelectionAction = Box::new(|tx| {
+            tx.send(AppEvent::OpenActivityDashboard);
+        });
+        Some(SelectionViewParams {
+            view_id: Some(SUBAGENT_ACTIVITY_DETAILS_VIEW_ID),
+            title: Some("Subagent".to_string()),
+            subtitle: Some(subagent.label),
+            header: Box::new(Paragraph::new(lines).wrap(Wrap { trim: false })),
+            footer_hint: Some(standard_popup_hint_line()),
+            items: vec![
+                SelectionItem {
+                    name: "Open transcript".to_string(),
+                    description: Some("Switch the chat view to this subagent.".to_string()),
+                    actions: vec![open_action],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+                interrupt_item,
+                SelectionItem {
+                    name: "Back to activity".to_string(),
+                    actions: vec![back_action],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+            ],
+            initial_selected_idx,
+            ..Default::default()
+        })
     }
 
     /// Record recent stdout/stderr lines for the unified exec footer.
     fn track_unified_exec_output_chunk(&mut self, call_id: &str, chunk: &[u8]) {
-        let Some(process) = self
-            .unified_exec_processes
-            .iter_mut()
-            .find(|process| process.call_id == call_id)
-        else {
-            return;
-        };
-
-        let text = String::from_utf8_lossy(chunk);
-        for line in text
-            .lines()
-            .map(str::trim_end)
-            .filter(|line| !line.is_empty())
-        {
-            process.recent_chunks.push(line.to_string());
-        }
-
-        const MAX_RECENT_CHUNKS: usize = 3;
-        if process.recent_chunks.len() > MAX_RECENT_CHUNKS {
-            let drop_count = process.recent_chunks.len() - MAX_RECENT_CHUNKS;
-            process.recent_chunks.drain(0..drop_count);
-        }
+        track_unified_exec_output_chunk(&mut self.unified_exec_processes, call_id, chunk);
+        self.refresh_activity_views_if_open();
     }
 
     fn on_mcp_tool_call_started(&mut self, item: ThreadItem) {
@@ -4523,6 +5610,7 @@ impl ChatWidget {
         self.bottom_pane.pre_draw_tick();
         self.refresh_plan_mode_nudge();
         self.refresh_goal_status_indicator_for_time_tick();
+        self.refresh_activity_views_for_time_tick();
         if self.terminal_title_shows_action_required() != self.last_terminal_title_requires_action {
             self.refresh_terminal_title();
         }
@@ -4679,8 +5767,7 @@ impl ChatWidget {
     /// merge unrelated commands and hide still-running exploring work.
     pub(crate) fn handle_command_execution_completed_now(&mut self, item: ThreadItem) {
         self.handle_command_execution_completed_now_with_runtime_cwd_sync(
-            item,
-            /*sync_runtime_cwd*/ true,
+            item, /*sync_runtime_cwd*/ true,
         );
     }
 
@@ -4764,6 +5851,15 @@ impl ChatWidget {
                 aggregated_output,
             }
         };
+        let user_shell_cd_command = if is_user_shell {
+            Some(
+                codex_shell_command::parse_command::extract_shell_command(&command)
+                    .map(|(_, command)| command.to_string())
+                    .unwrap_or_else(|| command.join(" ")),
+            )
+        } else {
+            None
+        };
 
         match end_target {
             ExecEndTarget::ActiveTracked => {
@@ -4821,10 +5917,7 @@ impl ChatWidget {
         }
         // Mark that actual work was done (command executed)
         self.had_work_activity = true;
-        if is_user_shell {
-            let cd_command = codex_shell_command::parse_command::extract_shell_command(&command)
-                .map(|(_, command)| command.to_string())
-                .unwrap_or_else(|| command.join(" "));
+        if let Some(cd_command) = user_shell_cd_command {
             if sync_runtime_cwd
                 && matches!(
                     status,
@@ -5318,6 +6411,11 @@ impl ChatWidget {
             turn_sleep_inhibitor: SleepInhibitor::new(prevent_idle_sleep),
             task_complete_pending: false,
             unified_exec_processes: Vec::new(),
+            background_terminal_activity_summaries: Vec::new(),
+            subagent_activity_summaries: Vec::new(),
+            active_background_terminal_details: None,
+            active_subagent_activity_details: None,
+            last_activity_view_refresh_at: None,
             agent_turn_running: false,
             mcp_startup_status: None,
             last_agent_markdown: None,
@@ -5489,6 +6587,18 @@ impl ChatWidget {
             if self.bottom_pane.no_modal_or_popup_active() {
                 self.maybe_send_next_queued_input();
             }
+            return;
+        }
+
+        if key_event.kind == KeyEventKind::Press
+            && key_event.code == KeyCode::Down
+            && self.bottom_pane.no_modal_or_popup_active()
+            && self.bottom_pane.composer_is_empty()
+            && (!self.unified_exec_processes.is_empty()
+                || !self.background_terminal_activity_summaries.is_empty()
+                || !self.subagent_activity_summaries.is_empty())
+        {
+            self.app_event_tx.send(AppEvent::OpenActivityDashboard);
             return;
         }
 
@@ -6517,6 +7627,7 @@ impl ChatWidget {
                 duration_ms,
             } = turn;
             if matches!(status, TurnStatus::InProgress) {
+                self.last_turn_id = Some(turn_id.clone());
                 self.last_non_retry_error = None;
                 self.on_task_started();
             }
@@ -6559,7 +7670,10 @@ impl ChatWidget {
             status,
         } = &item
         {
-            if !matches!(status, codex_app_server_protocol::PatchApplyStatus::Declined) {
+            if !matches!(
+                status,
+                codex_app_server_protocol::PatchApplyStatus::Declined
+            ) {
                 self.on_patch_apply_begin(
                     id.clone(),
                     changes.clone(),
@@ -6630,15 +7744,15 @@ impl ChatWidget {
             item @ ThreadItem::CommandExecution {
                 status: codex_app_server_protocol::CommandExecutionStatus::InProgress,
                 ..
-            } => self.on_command_execution_started(item),
+            } => self.on_command_execution_started(item, Some(&turn_id), from_replay),
             item @ ThreadItem::CommandExecution { .. } => {
                 if from_replay {
+                    self.handle_replayed_unified_exec_completion(&item, Some(&turn_id));
                     self.handle_command_execution_completed_now_with_runtime_cwd_sync(
-                        item,
-                        /*sync_runtime_cwd*/ false,
+                        item, /*sync_runtime_cwd*/ false,
                     );
                 } else {
-                    self.on_command_execution_completed(item);
+                    self.on_command_execution_completed(item, Some(&turn_id));
                 }
             }
             ThreadItem::FileChange {
@@ -6999,6 +8113,9 @@ impl ChatWidget {
         notification: TurnCompletedNotification,
         replay_kind: Option<ReplayKind>,
     ) {
+        if !matches!(notification.turn.status, TurnStatus::InProgress) {
+            self.mark_unified_exec_processes_turn_completed(notification.turn.id.as_str());
+        }
         match notification.turn.status {
             TurnStatus::Completed => {
                 self.last_non_retry_error = None;
@@ -7045,8 +8162,11 @@ impl ChatWidget {
         notification: ItemStartedNotification,
         from_replay: bool,
     ) {
+        let turn_id = notification.turn_id.clone();
         match notification.item {
-            item @ ThreadItem::CommandExecution { .. } => self.on_command_execution_started(item),
+            item @ ThreadItem::CommandExecution { .. } => {
+                self.on_command_execution_started(item, Some(&turn_id), from_replay)
+            }
             ThreadItem::FileChange { id, changes, .. } => {
                 if from_replay {
                     self.replayed_file_change_starts.insert(id.clone());
@@ -7087,6 +8207,25 @@ impl ChatWidget {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn handle_replayed_unified_exec_completion(
+        &mut self,
+        item: &ThreadItem,
+        _turn_id: Option<&str>,
+    ) {
+        let ThreadItem::CommandExecution {
+            id,
+            process_id,
+            source,
+            ..
+        } = item
+        else {
+            return;
+        };
+        if is_unified_exec_source(*source) {
+            self.track_unified_exec_process_end(id, process_id.as_deref());
         }
     }
 
@@ -7354,10 +8493,23 @@ impl ChatWidget {
             };
             match queued_message.action {
                 QueuedInputAction::Plain => {
-                    submitted_follow_up = self.submit_user_message_with_history_record(
-                        queued_message.into_user_message(),
-                        history_record,
-                    );
+                    let user_message = queued_message.into_user_message();
+                    submitted_follow_up = if is_completion_wakeup_history(&history_record) {
+                        if let Some(thread_id) = self.thread_id {
+                            self.submit_plain_wakeup_to_thread(
+                                thread_id,
+                                user_message,
+                                history_record,
+                            )
+                        } else {
+                            self.submit_user_message_with_history_record(
+                                user_message,
+                                history_record,
+                            )
+                        }
+                    } else {
+                        self.submit_user_message_with_history_record(user_message, history_record)
+                    };
                     break;
                 }
                 QueuedInputAction::ParseSlash => {
@@ -7673,8 +8825,6 @@ impl ChatWidget {
 
     fn clean_background_terminals(&mut self) {
         self.submit_op(AppCommand::clean_background_terminals());
-        self.unified_exec_processes.clear();
-        self.sync_unified_exec_footer();
         self.add_info_message(
             "Stopping all background terminals.".to_string(),
             /*hint*/ None,
@@ -11138,6 +12288,146 @@ impl ChatWidget {
                 self.app_event_tx.send(AppEvent::CodexOp(op));
             }
         }
+        true
+    }
+
+    fn submit_op_to_thread<T>(&mut self, thread_id: ThreadId, op: T) -> bool
+    where
+        T: Into<AppCommand>,
+    {
+        let op: AppCommand = op.into();
+        self.prepare_local_op_submission(&op);
+        if op.is_review() && !self.bottom_pane.is_task_running() {
+            self.bottom_pane.set_task_running(/*running*/ true);
+        }
+        match &self.codex_op_target {
+            CodexOpTarget::Direct(codex_op_tx) => {
+                crate::session_log::log_outbound_op(&op);
+                if let Err(e) = codex_op_tx.send(op) {
+                    tracing::error!("failed to submit op: {e}");
+                    return false;
+                }
+            }
+            CodexOpTarget::AppEvent => {
+                self.app_event_tx
+                    .send(AppEvent::SubmitThreadOp { thread_id, op });
+            }
+        }
+        true
+    }
+
+    fn submit_plain_wakeup_to_thread(
+        &mut self,
+        thread_id: ThreadId,
+        user_message: UserMessage,
+        history_record: UserMessageHistoryRecord,
+    ) -> bool {
+        if !self.is_session_configured() {
+            tracing::warn!("cannot submit wakeup before session is configured; queueing");
+            self.queued_user_messages
+                .push_front(QueuedUserMessage::from(user_message));
+            self.queued_user_message_history_records
+                .push_front(history_record);
+            self.refresh_pending_input_preview();
+            return true;
+        }
+
+        let UserMessage {
+            text,
+            local_images,
+            remote_image_urls,
+            text_elements,
+            mention_bindings,
+        } = user_message;
+        if text.is_empty() {
+            return false;
+        }
+
+        let effective_mode = self.effective_collaboration_mode();
+        if effective_mode.model().trim().is_empty() {
+            self.add_error_message(
+                "Thread model is unavailable. Wait for the thread to finish syncing or choose a model before sending input.".to_string(),
+            );
+            self.restore_user_message_to_composer(user_message_for_restore(
+                UserMessage {
+                    text,
+                    local_images,
+                    remote_image_urls,
+                    text_elements,
+                    mention_bindings,
+                },
+                &history_record,
+            ));
+            return false;
+        }
+
+        let mut items = vec![UserInput::Text {
+            text: text.clone(),
+            text_elements: app_server_text_elements(&text_elements),
+        }];
+        self.maybe_apply_ide_context(&mut items);
+
+        let collaboration_mode = if self.collaboration_modes_enabled() {
+            self.active_collaboration_mask
+                .as_ref()
+                .map(|_| effective_mode.clone())
+        } else {
+            None
+        };
+        let personality = self
+            .config
+            .personality
+            .filter(|_| self.config.features.enabled(Feature::Personality))
+            .filter(|_| self.current_model_supports_personality());
+        let service_tier = match self.config.service_tier.clone() {
+            Some(service_tier) => Some(Some(service_tier)),
+            None if self.config.notices.fast_default_opt_out == Some(true) => Some(None),
+            None => None,
+        };
+        let permission_profile = self.config.permissions.permission_profile();
+        let op = AppCommand::user_turn(
+            items,
+            self.config.cwd.to_path_buf(),
+            AskForApproval::from(self.config.permissions.approval_policy.value()),
+            permission_profile,
+            effective_mode.model().to_string(),
+            effective_mode.reasoning_effort(),
+            /*summary*/ None,
+            service_tier,
+            /*final_output_json_schema*/ None,
+            collaboration_mode,
+            personality,
+        );
+
+        if !self.submit_op_to_thread(thread_id, op) {
+            return false;
+        }
+        self.user_turn_pending_start = true;
+
+        let history_text = match &history_record {
+            UserMessageHistoryRecord::UserMessageText if !text.is_empty() => Some(text.clone()),
+            UserMessageHistoryRecord::Override(history) if !history.text.is_empty() => {
+                Some(history.text.clone())
+            }
+            UserMessageHistoryRecord::UserMessageText | UserMessageHistoryRecord::Override(_) => {
+                None
+            }
+        };
+        if let Some(history_text) = history_text {
+            self.append_message_history_entry(history_text);
+        }
+
+        self.on_user_message_display(user_message_display_for_history(
+            UserMessage {
+                text,
+                local_images,
+                remote_image_urls,
+                text_elements,
+                mention_bindings,
+            },
+            &history_record,
+        ));
+        self.needs_final_message_separator = false;
         true
     }
 

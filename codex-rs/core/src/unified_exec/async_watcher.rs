@@ -2,6 +2,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
+use tokio::sync::oneshot;
 use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio::time::Sleep;
@@ -37,12 +38,18 @@ const UNIFIED_EXEC_OUTPUT_DELTA_MAX_BYTES: usize = 8192;
 /// Spawn a background task that continuously reads from the PTY, appends to the
 /// shared transcript, and emits ExecCommandOutputDelta events on UTF‑8
 /// boundaries.
-pub(crate) fn start_streaming_output(
+pub(crate) async fn start_streaming_output(
     process: &UnifiedExecProcess,
     context: &UnifiedExecContext,
     transcript: Arc<Mutex<HeadTailBuffer>>,
+    begin_emitted: oneshot::Receiver<()>,
 ) {
+    let handles = process.output_handles();
+    let output_buffer = handles.output_buffer;
+    let guard = output_buffer.lock().await;
+    let seed_chunks = guard.snapshot_chunks();
     let mut receiver = process.output_receiver();
+    drop(guard);
     let output_drained = process.output_drained_notify();
     let exit_token = process.cancellation_token();
 
@@ -53,8 +60,23 @@ pub(crate) fn start_streaming_output(
     tokio::spawn(async move {
         use tokio::sync::broadcast::error::RecvError;
 
+        let _ = begin_emitted.await;
+
         let mut pending = Vec::<u8>::new();
         let mut emitted_deltas: usize = 0;
+
+        for chunk in seed_chunks {
+            process_chunk(
+                &mut pending,
+                &transcript,
+                &call_id,
+                &session_ref,
+                &turn_ref,
+                &mut emitted_deltas,
+                chunk,
+            )
+            .await;
+        }
 
         let mut grace_sleep: Option<Pin<Box<Sleep>>> = None;
 
@@ -204,7 +226,11 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
     exit_code: i32,
     duration: Duration,
 ) {
-    let aggregated_output = resolve_aggregated_output(&transcript, fallback_output).await;
+    let aggregated_output = if fallback_output.is_empty() {
+        resolve_aggregated_output(&transcript, fallback_output).await
+    } else {
+        fallback_output
+    };
     let output = ExecToolCallOutput {
         exit_code,
         stdout: StreamOutput::new(aggregated_output.clone()),

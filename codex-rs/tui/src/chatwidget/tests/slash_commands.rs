@@ -1559,10 +1559,51 @@ async fn slash_exit_requests_exit() {
 #[tokio::test]
 async fn slash_stop_submits_background_terminal_cleanup() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let active_thread_id = ThreadId::new();
+    let inactive_thread_id = ThreadId::new();
+    chat.thread_id = Some(active_thread_id);
+    chat.unified_exec_processes.push(UnifiedExecProcessSummary {
+        key: "proc-active".to_string(),
+        process_id: Some("proc-active".to_string()),
+        call_id: "call-active".to_string(),
+        command_display: "cargo test active".to_string(),
+        recent_chunks: Vec::new(),
+        turn_id: Some("turn-active".to_string()),
+        started_at: std::time::Instant::now(),
+        completion_wakeup_eligible: true,
+    });
+    chat.set_background_terminal_activity_summaries(vec![
+        BackgroundTerminalActivitySummary {
+            thread_id: active_thread_id,
+            key: "proc-active".to_string(),
+            process_id: Some("proc-active".to_string()),
+            call_id: "call-active".to_string(),
+            command_display: "cargo test active".to_string(),
+            recent_chunks: Vec::new(),
+            started_at: std::time::Instant::now(),
+        },
+        BackgroundTerminalActivitySummary {
+            thread_id: inactive_thread_id,
+            key: "proc-inactive".to_string(),
+            process_id: Some("proc-inactive".to_string()),
+            call_id: "call-inactive".to_string(),
+            command_display: "cargo test inactive".to_string(),
+            recent_chunks: Vec::new(),
+            started_at: std::time::Instant::now(),
+        },
+    ]);
 
     chat.dispatch_command(SlashCommand::Stop);
 
     assert_matches!(op_rx.try_recv(), Ok(Op::CleanBackgroundTerminals));
+    assert_eq!(chat.unified_exec_processes.len(), 1);
+    assert_eq!(
+        chat.background_terminal_activity_summaries
+            .iter()
+            .map(|summary| summary.command_display.as_str())
+            .collect::<Vec<_>>(),
+        vec!["cargo test active", "cargo test inactive"]
+    );
     let cells = drain_insert_history(&mut rx);
     assert_eq!(cells.len(), 1, "expected cleanup confirmation message");
     let rendered = lines_to_single_string(&cells[0]);
@@ -1570,6 +1611,22 @@ async fn slash_stop_submits_background_terminal_cleanup() {
         rendered.contains("Stopping all background terminals."),
         "expected cleanup confirmation, got {rendered:?}"
     );
+
+    chat.clear_background_terminals_after_clean();
+    assert!(chat.unified_exec_processes.is_empty());
+    assert_eq!(
+        chat.background_terminal_activity_summaries
+            .iter()
+            .map(|summary| summary.command_display.as_str())
+            .collect::<Vec<_>>(),
+        vec!["cargo test inactive"]
+    );
+    chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_matches!(rx.try_recv(), Ok(AppEvent::OpenActivityDashboard));
+    chat.open_activity_dashboard();
+    let rendered = render_bottom_popup(&chat, /*width*/ 72);
+    assert!(!rendered.contains("cargo test active"));
+    assert!(rendered.contains("cargo test inactive"));
 }
 
 #[tokio::test]

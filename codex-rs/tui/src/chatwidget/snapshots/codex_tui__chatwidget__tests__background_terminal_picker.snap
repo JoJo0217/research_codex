@@ -1,0 +1,10 @@
+---
+source: tui/src/chatwidget/tests/exec_flow.rs
+expression: rendered
+---
+  Activity
+  Select a task to view status, recent output, or stop actions.
+
+› 1. • cargo test -p codex-tui  Terminal · running 0s · running tests
+
+  Press enter to confirm or esc to go back

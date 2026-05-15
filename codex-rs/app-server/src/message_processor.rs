@@ -996,6 +996,11 @@ impl MessageProcessor {
                     .thread_background_terminals_clean(&request_id, params)
                     .await
             }
+            ClientRequest::ThreadBackgroundTerminalTerminate { params, .. } => {
+                self.thread_processor
+                    .thread_background_terminal_terminate(&request_id, params)
+                    .await
+            }
             ClientRequest::ThreadRollback { params, .. } => {
                 self.thread_processor
                     .thread_rollback(&request_id, params)

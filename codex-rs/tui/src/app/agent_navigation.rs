@@ -25,6 +25,7 @@ use crate::multi_agents::previous_agent_shortcut;
 use codex_protocol::ThreadId;
 use ratatui::text::Span;
 use std::collections::HashMap;
+use std::time::Instant;
 
 /// Small state container for multi-agent picker ordering and labeling.
 ///
@@ -41,6 +42,8 @@ pub(crate) struct AgentNavigationState {
     threads: HashMap<ThreadId, AgentPickerThreadEntry>,
     /// Stable first-seen traversal order for picker rows and keyboard cycling.
     order: Vec<ThreadId>,
+    /// First time each thread appeared in the TUI, used for lightweight activity elapsed time.
+    started_at: HashMap<ThreadId, Instant>,
 }
 
 /// Direction of keyboard traversal through the stable picker order.
@@ -83,8 +86,14 @@ impl AgentNavigationState {
         agent_role: Option<String>,
         is_closed: bool,
     ) {
+        let is_closed = is_closed
+            || self
+                .threads
+                .get(&thread_id)
+                .is_some_and(|entry| entry.is_closed);
         if !self.threads.contains_key(&thread_id) {
             self.order.push(thread_id);
+            self.started_at.insert(thread_id, Instant::now());
         }
         self.threads.insert(
             thread_id,
@@ -102,14 +111,17 @@ impl AgentNavigationState {
     /// next/previous navigation does not reshuffle around disappearing entries. If a caller "cleans
     /// this up" by deleting the entry instead, wraparound navigation will silently change shape
     /// mid-session.
-    pub(crate) fn mark_closed(&mut self, thread_id: ThreadId) {
+    pub(crate) fn mark_closed(&mut self, thread_id: ThreadId) -> bool {
         if let Some(entry) = self.threads.get_mut(&thread_id) {
+            let was_open = !entry.is_closed;
             entry.is_closed = true;
+            was_open
         } else {
             self.upsert(
                 thread_id, /*agent_nickname*/ None, /*agent_role*/ None,
                 /*is_closed*/ true,
             );
+            true
         }
     }
 
@@ -120,6 +132,7 @@ impl AgentNavigationState {
     pub(crate) fn clear(&mut self) {
         self.threads.clear();
         self.order.clear();
+        self.started_at.clear();
     }
 
     /// Removes a tracked thread entirely from picker metadata and traversal order.
@@ -130,6 +143,12 @@ impl AgentNavigationState {
     pub(crate) fn remove(&mut self, thread_id: ThreadId) {
         self.threads.remove(&thread_id);
         self.order.retain(|candidate| *candidate != thread_id);
+        self.started_at.remove(&thread_id);
+    }
+
+    /// Returns when a thread first appeared in the navigation cache.
+    pub(crate) fn started_at(&self, thread_id: ThreadId) -> Option<Instant> {
+        self.started_at.get(&thread_id).copied()
     }
 
     /// Returns whether there is at least one tracked thread other than the primary one.

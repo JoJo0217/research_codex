@@ -175,6 +175,7 @@ struct PreparedProcessHandles {
     session: Option<Arc<crate::session::session::Session>>,
     network_approval: Option<DeferredNetworkApproval>,
     hook_command: String,
+    call_id: String,
     process_id: i32,
     tty: bool,
 }
@@ -366,6 +367,42 @@ impl UnifiedExecProcessManager {
         }
     }
 
+    async fn release_process_id_for_process(
+        &self,
+        process_id: i32,
+        process: &Arc<UnifiedExecProcess>,
+    ) {
+        let removed = {
+            let mut store = self.process_store.lock().await;
+            match store.processes.get(&process_id) {
+                Some(entry) if Arc::ptr_eq(&entry.process, process) => store.remove(process_id),
+                Some(_) => None,
+                None => None,
+            }
+        };
+        if let Some(entry) = removed {
+            unregister_network_approval_for_entry(&entry).await;
+        }
+    }
+
+    pub(crate) async fn terminate_process(&self, process_id: i32) -> bool {
+        let removed = {
+            let mut store = self.process_store.lock().await;
+            let removed = store.processes.remove(&process_id);
+            if removed.is_some() {
+                store.reserved_process_ids.remove(&process_id);
+            }
+            removed
+        };
+        let Some(entry) = removed else {
+            return false;
+        };
+
+        unregister_network_approval_for_entry(&entry).await;
+        entry.process.terminate();
+        true
+    }
+
     pub(crate) async fn exec_command(
         &self,
         request: ExecCommandRequest,
@@ -394,6 +431,26 @@ impl UnifiedExecProcessManager {
         }
 
         let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
+        let start = Instant::now();
+        // Persist live sessions before advertising the process id so stop/clean
+        // requests cannot miss a just-started background terminal.
+        let process_started_alive = !process.has_exited() && process.exit_code().is_none();
+        if process_started_alive {
+            self.store_process(
+                Arc::clone(&process),
+                context,
+                request.hook_command.clone(),
+                start,
+                request.process_id,
+                request.tty,
+                deferred_network_approval.clone(),
+            )
+            .await;
+        }
+
+        let (stream_begin_tx, stream_begin_rx) = tokio::sync::oneshot::channel();
+        start_streaming_output(&process, context, Arc::clone(&transcript), stream_begin_rx).await;
+
         let event_ctx = ToolEventCtx::new(
             context.session.as_ref(),
             context.turn.as_ref(),
@@ -407,26 +464,19 @@ impl UnifiedExecProcessManager {
             Some(request.process_id.to_string()),
         );
         emitter.emit(event_ctx, ToolEventStage::Begin).await;
-
-        start_streaming_output(&process, context, Arc::clone(&transcript));
-        let start = Instant::now();
-        // Persist live sessions before the initial yield wait so interrupting the
-        // turn cannot drop the last Arc and terminate the background process.
-        let process_started_alive = !process.has_exited() && process.exit_code().is_none();
+        let _ = stream_begin_tx.send(());
         if process_started_alive {
-            self.store_process(
+            spawn_exit_watcher(
                 Arc::clone(&process),
-                context,
-                &request.command,
-                request.hook_command.clone(),
+                Arc::clone(&context.session),
+                Arc::clone(&context.turn),
+                context.call_id.clone(),
+                request.command.clone(),
                 cwd.clone(),
-                start,
                 request.process_id,
-                request.tty,
-                deferred_network_approval.clone(),
-                Arc::clone(&transcript),
-            )
-            .await;
+                process.transcript_buffer(),
+                start,
+            );
         }
 
         let yield_time_ms = clamp_yield_time(request.yield_time_ms);
@@ -479,7 +529,12 @@ impl UnifiedExecProcessManager {
                 wall_time,
             )
             .await;
-            self.release_process_id(request.process_id).await;
+            if process_started_alive {
+                self.release_process_id_for_process(request.process_id, &process)
+                    .await;
+            } else {
+                self.release_process_id(request.process_id).await;
+            }
             return Err(fail_process_with_message(process.as_ref(), message));
         }
         if let Some(message) = process.failure_message() {
@@ -499,7 +554,12 @@ impl UnifiedExecProcessManager {
                 wall_time,
             )
             .await;
-            self.release_process_id(request.process_id).await;
+            if process_started_alive {
+                self.release_process_id_for_process(request.process_id, &process)
+                    .await;
+            } else {
+                self.release_process_id(request.process_id).await;
+            }
             if let Err(message) = finish_result {
                 return Err(fail_process_with_message(process.as_ref(), message));
             }
@@ -507,7 +567,10 @@ impl UnifiedExecProcessManager {
         }
         let process_id = request.process_id;
         let (response_process_id, exit_code) = if process_started_alive {
-            match self.refresh_process_state(process_id).await {
+            match self
+                .refresh_process_state_for_process(process_id, &process)
+                .await
+            {
                 ProcessStatus::Alive {
                     exit_code,
                     process_id,
@@ -527,7 +590,17 @@ impl UnifiedExecProcessManager {
                     (None, exit_code)
                 }
                 ProcessStatus::Unknown => {
-                    return Err(UnifiedExecError::UnknownProcessId { process_id });
+                    if let Err(message) =
+                        finish_deferred_network_approval_after_process_exit_for_session(
+                            Some(&context.session),
+                            deferred_network_approval.take(),
+                        )
+                        .await
+                    {
+                        return Err(fail_process_with_message(process.as_ref(), message));
+                    }
+                    process.check_for_sandbox_denial_with_text(&text).await?;
+                    (None, process.exit_code())
                 }
             }
         } else {
@@ -608,6 +681,7 @@ impl UnifiedExecProcessManager {
             session,
             network_approval,
             hook_command,
+            call_id,
             process_id,
             tty,
             ..
@@ -625,12 +699,18 @@ impl UnifiedExecProcessManager {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 Err(err) => {
-                    let status = self.refresh_process_state(process_id).await;
-                    if matches!(status, ProcessStatus::Exited { .. }) {
+                    let status = self
+                        .refresh_process_state_for_process(process_id, &process)
+                        .await;
+                    if matches!(
+                        status,
+                        ProcessStatus::Exited { .. } | ProcessStatus::Unknown
+                    ) {
                         status_after_write = Some(status);
                     } else if matches!(err, UnifiedExecError::ProcessFailed { .. }) {
                         process.terminate();
-                        self.release_process_id(process_id).await;
+                        self.release_process_id_for_process(process_id, &process)
+                            .await;
                         return Err(err);
                     } else {
                         return Err(err);
@@ -673,7 +753,8 @@ impl UnifiedExecProcessManager {
             let message =
                 network_denial_message_for_session(session.as_ref(), network_approval.clone())
                     .await;
-            self.release_process_id(process_id).await;
+            self.release_process_id_for_process(process_id, &process)
+                .await;
             return Err(fail_process_with_message(process.as_ref(), message));
         }
         if let Some(message) = process.failure_message() {
@@ -682,7 +763,8 @@ impl UnifiedExecProcessManager {
                 network_approval.clone(),
             )
             .await;
-            self.release_process_id(process_id).await;
+            self.release_process_id_for_process(process_id, &process)
+                .await;
             if let Err(message) = finish_result {
                 return Err(fail_process_with_message(process.as_ref(), message));
             }
@@ -696,7 +778,8 @@ impl UnifiedExecProcessManager {
         let status = if let Some(status) = status_after_write {
             status
         } else {
-            self.refresh_process_state(process_id).await
+            self.refresh_process_state_for_process(process_id, &process)
+                .await
         };
         let (process_id, exit_code, event_call_id) = match status {
             ProcessStatus::Alive {
@@ -714,9 +797,16 @@ impl UnifiedExecProcessManager {
                 (None, exit_code, call_id)
             }
             ProcessStatus::Unknown => {
-                return Err(UnifiedExecError::UnknownProcessId {
-                    process_id: request.process_id,
-                });
+                if let Err(message) =
+                    finish_deferred_network_approval_after_process_exit_for_session(
+                        session.as_ref(),
+                        network_approval.clone(),
+                    )
+                    .await
+                {
+                    return Err(fail_process_with_message(process.as_ref(), message));
+                }
+                (None, process.exit_code(), call_id)
             }
         };
 
@@ -735,12 +825,19 @@ impl UnifiedExecProcessManager {
         Ok(response)
     }
 
-    async fn refresh_process_state(&self, process_id: i32) -> ProcessStatus {
+    async fn refresh_process_state_for_process(
+        &self,
+        process_id: i32,
+        process: &Arc<UnifiedExecProcess>,
+    ) -> ProcessStatus {
         {
             let mut store = self.process_store.lock().await;
             let Some(entry) = store.processes.get(&process_id) else {
                 return ProcessStatus::Unknown;
             };
+            if !Arc::ptr_eq(&entry.process, process) {
+                return ProcessStatus::Unknown;
+            }
 
             let exit_code = entry.process.exit_code();
             let process_id = entry.process_id;
@@ -797,6 +894,7 @@ impl UnifiedExecProcessManager {
             session,
             network_approval: entry.network_approval.clone(),
             hook_command: entry.hook_command.clone(),
+            call_id: entry.call_id.clone(),
             process_id: entry.process_id,
             tty: entry.tty,
         })
@@ -807,14 +905,11 @@ impl UnifiedExecProcessManager {
         &self,
         process: Arc<UnifiedExecProcess>,
         context: &UnifiedExecContext,
-        command: &[String],
         hook_command: String,
-        cwd: AbsolutePathBuf,
         started_at: Instant,
         process_id: i32,
         tty: bool,
         network_approval: Option<DeferredNetworkApproval>,
-        transcript: Arc<tokio::sync::Mutex<HeadTailBuffer>>,
     ) {
         let entry = ProcessEntry {
             process: Arc::clone(&process),
@@ -848,18 +943,6 @@ impl UnifiedExecProcessManager {
                 )
                 .await;
         };
-
-        spawn_exit_watcher(
-            Arc::clone(&process),
-            Arc::clone(&context.session),
-            Arc::clone(&context.turn),
-            context.call_id.clone(),
-            command.to_vec(),
-            cwd,
-            process_id,
-            transcript,
-            started_at,
-        );
     }
 
     pub(crate) async fn open_session_with_exec_env(
@@ -1247,7 +1330,9 @@ impl UnifiedExecProcessManager {
                 .drain()
                 .map(|(_, entry)| entry)
                 .collect();
-            processes.reserved_process_ids.clear();
+            for entry in &entries {
+                processes.reserved_process_ids.remove(&entry.process_id);
+            }
             entries
         };
 

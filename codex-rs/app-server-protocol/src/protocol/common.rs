@@ -559,6 +559,12 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadBackgroundTerminalsCleanResponse,
     },
+    #[experimental("thread/backgroundTerminal/terminate")]
+    ThreadBackgroundTerminalTerminate => "thread/backgroundTerminal/terminate" {
+        params: v2::ThreadBackgroundTerminalTerminateParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadBackgroundTerminalTerminateResponse,
+    },
     ThreadRollback => "thread/rollback" {
         params: v2::ThreadRollbackParams,
         serialization: thread_id(params.thread_id),
@@ -2629,6 +2635,29 @@ mod tests {
                 "id": 8,
                 "params": {
                     "threadId": "thr_123"
+                }
+            }),
+            serde_json::to_value(&request)?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_thread_background_terminal_terminate() -> Result<()> {
+        let request = ClientRequest::ThreadBackgroundTerminalTerminate {
+            request_id: RequestId::Integer(8),
+            params: v2::ThreadBackgroundTerminalTerminateParams {
+                thread_id: "thr_123".to_string(),
+                process_id: "1001".to_string(),
+            },
+        };
+        assert_eq!(
+            json!({
+                "method": "thread/backgroundTerminal/terminate",
+                "id": 8,
+                "params": {
+                    "threadId": "thr_123",
+                    "processId": "1001"
                 }
             }),
             serde_json::to_value(&request)?,

@@ -699,9 +699,13 @@ async fn unified_exec_wait_status_header_updates_on_late_command_display() {
     chat.on_task_started();
     chat.unified_exec_processes.push(UnifiedExecProcessSummary {
         key: "proc-1".to_string(),
+        process_id: Some("proc-1".to_string()),
         call_id: "call-1".to_string(),
         command_display: "sleep 5".to_string(),
         recent_chunks: Vec::new(),
+        turn_id: Some("turn-1".to_string()),
+        started_at: Instant::now(),
+        completion_wakeup_eligible: true,
     });
 
     terminal_interaction(&mut chat, "call-1", "proc-1", "");
@@ -1319,6 +1323,632 @@ async fn turn_complete_keeps_unified_exec_processes() {
     );
 
     let _ = drain_insert_history(&mut rx);
+}
+
+#[tokio::test]
+async fn unified_exec_completion_after_turn_complete_wakes_agent() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    handle_turn_started(&mut chat, "turn-1");
+    let begin = begin_unified_exec_startup(
+        &mut chat,
+        "call-bg",
+        "process-bg",
+        "cargo test -p codex-tui",
+    );
+    handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
+    let _ = drain_insert_history(&mut rx);
+    assert_no_submit_op(&mut op_rx);
+
+    end_exec(
+        &mut chat,
+        begin,
+        "test result: ok\n",
+        "",
+        /*exit_code*/ 0,
+    );
+
+    let expected_prompt = concat!(
+        "Background terminal completed.\n\n",
+        "Command: cargo test -p codex-tui\n",
+        "Status: completed\n",
+        "Exit code: 0\n\n",
+        "Output:\n",
+        "test result: ok\n\n",
+        "Continue from this result. If it failed, diagnose the failure before starting another ",
+        "long-running command."
+    )
+    .to_string();
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: expected_prompt,
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected wakeup user turn, got {other:?}"),
+    }
+    assert!(chat.unified_exec_processes.is_empty());
+
+    let cells = drain_insert_history(&mut rx);
+    let rendered = cells
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("Background terminal completed: cargo test -p codex-tui"),
+        "expected a concise wakeup history row, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn unified_exec_completion_queues_wakeup_while_prior_wakeup_pending() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    handle_turn_started(&mut chat, "turn-1");
+    let first = begin_unified_exec_startup(&mut chat, "call-bg-1", "process-bg-1", "sleep 1");
+    let second = begin_unified_exec_startup(&mut chat, "call-bg-2", "process-bg-2", "sleep 2");
+    handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
+    let _ = drain_insert_history(&mut rx);
+    assert_no_submit_op(&mut op_rx);
+
+    end_exec(&mut chat, first, "first done\n", "", /*exit_code*/ 0);
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => match items.as_slice() {
+            [UserInput::Text { text, .. }] => {
+                assert!(text.contains("Command: sleep 1"), "got prompt: {text:?}");
+            }
+            other => panic!("expected text wakeup, got {other:?}"),
+        },
+        other => panic!("expected first wakeup user turn, got {other:?}"),
+    }
+
+    end_exec(&mut chat, second, "second done\n", "", /*exit_code*/ 0);
+    assert_no_submit_op(&mut op_rx);
+    assert_eq!(chat.queued_user_messages.len(), 1);
+
+    handle_turn_started(&mut chat, "turn-wakeup-1");
+    handle_turn_completed(&mut chat, "turn-wakeup-1", /*duration_ms*/ None);
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => match items.as_slice() {
+            [UserInput::Text { text, .. }] => {
+                assert!(text.contains("Command: sleep 2"), "got prompt: {text:?}");
+            }
+            other => panic!("expected text wakeup, got {other:?}"),
+        },
+        other => panic!("expected queued wakeup user turn, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn prior_turn_background_completion_queues_while_another_turn_runs() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    handle_turn_started(&mut chat, "turn-background");
+    let background = begin_unified_exec_startup(
+        &mut chat,
+        "call-bg",
+        "process-bg",
+        "cargo test -p codex-tui",
+    );
+    handle_turn_completed(&mut chat, "turn-background", /*duration_ms*/ None);
+    let _ = drain_insert_history(&mut rx);
+    assert_no_submit_op(&mut op_rx);
+
+    handle_turn_started(&mut chat, "turn-active");
+    end_exec(
+        &mut chat,
+        background,
+        "test result: ok\n",
+        "",
+        /*exit_code*/ 0,
+    );
+    assert_no_submit_op(&mut op_rx);
+    assert_eq!(chat.queued_user_messages.len(), 1);
+    assert!(chat.unified_exec_processes.is_empty());
+
+    handle_turn_completed(&mut chat, "turn-active", /*duration_ms*/ None);
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => match items.as_slice() {
+            [UserInput::Text { text, .. }] => {
+                assert!(
+                    text.contains("Command: cargo test -p codex-tui")
+                        && text.contains("test result: ok"),
+                    "got prompt: {text:?}"
+                );
+            }
+            other => panic!("expected text wakeup, got {other:?}"),
+        },
+        other => panic!("expected queued wakeup user turn, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn interrupted_turn_background_completion_wakes_after_turn_end() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    handle_turn_started(&mut chat, "turn-background");
+    let background = begin_unified_exec_startup(
+        &mut chat,
+        "call-bg",
+        "process-bg",
+        "cargo test -p codex-tui",
+    );
+    handle_turn_interrupted(&mut chat, "turn-background");
+    assert_no_submit_op(&mut op_rx);
+
+    end_exec(
+        &mut chat,
+        background,
+        "test result: ok\n",
+        "",
+        /*exit_code*/ 0,
+    );
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => match items.as_slice() {
+            [UserInput::Text { text, .. }] => {
+                assert!(
+                    text.contains("Command: cargo test -p codex-tui")
+                        && text.contains("test result: ok"),
+                    "got prompt: {text:?}"
+                );
+            }
+            other => panic!("expected text wakeup, got {other:?}"),
+        },
+        other => panic!("expected background completion wakeup, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn background_completion_queues_while_mcp_startup_is_running() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    handle_turn_started(&mut chat, "turn-background");
+    let background = begin_unified_exec_startup(
+        &mut chat,
+        "call-bg",
+        "process-bg",
+        "cargo test -p codex-tui",
+    );
+    handle_turn_completed(&mut chat, "turn-background", /*duration_ms*/ None);
+    let _ = drain_insert_history(&mut rx);
+    assert_no_submit_op(&mut op_rx);
+
+    chat.mcp_startup_status = Some(std::collections::HashMap::new());
+    chat.update_task_running_state();
+    end_exec(
+        &mut chat,
+        background,
+        "test result: ok\n",
+        "",
+        /*exit_code*/ 0,
+    );
+    assert_no_submit_op(&mut op_rx);
+    assert_eq!(chat.queued_user_messages.len(), 1);
+
+    chat.finish_mcp_startup(Vec::new(), Vec::new());
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => match items.as_slice() {
+            [UserInput::Text { text, .. }] => {
+                assert!(
+                    text.contains("Command: cargo test -p codex-tui")
+                        && text.contains("test result: ok"),
+                    "got prompt: {text:?}"
+                );
+            }
+            other => panic!("expected text wakeup, got {other:?}"),
+        },
+        other => panic!("expected queued wakeup user turn, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn current_turn_unified_exec_completion_does_not_queue_during_mcp_startup() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    handle_turn_started(&mut chat, "turn-active");
+    let current = begin_unified_exec_startup(&mut chat, "call-bg", "process-bg", "cargo test");
+    chat.mcp_startup_status = Some(std::collections::HashMap::new());
+    chat.update_task_running_state();
+
+    end_exec(
+        &mut chat,
+        current,
+        "test result: ok\n",
+        "",
+        /*exit_code*/ 0,
+    );
+
+    assert_no_submit_op(&mut op_rx);
+    assert!(chat.queued_user_messages.is_empty());
+    assert!(chat.unified_exec_processes.is_empty());
+}
+
+#[tokio::test]
+async fn replayed_active_turn_id_keeps_prior_background_completion_queued() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    chat.unified_exec_processes.push(UnifiedExecProcessSummary {
+        key: "process-bg".to_string(),
+        process_id: Some("process-bg".to_string()),
+        call_id: "call-bg".to_string(),
+        command_display: "cargo test -p codex-tui".to_string(),
+        recent_chunks: Vec::new(),
+        turn_id: Some("turn-background".to_string()),
+        started_at: Instant::now(),
+        completion_wakeup_eligible: true,
+    });
+    chat.replay_thread_turns(
+        vec![app_server_turn(
+            "turn-active",
+            AppServerTurnStatus::InProgress,
+            /*duration_ms*/ None,
+            /*error*/ None,
+        )],
+        ReplayKind::ThreadSnapshot,
+    );
+    assert_eq!(chat.last_turn_id.as_deref(), Some("turn-active"));
+
+    let cwd = chat.config.cwd.clone();
+    let completed = AppServerThreadItem::CommandExecution {
+        id: "call-bg".to_string(),
+        command: "cargo test -p codex-tui".to_string(),
+        cwd,
+        process_id: Some("process-bg".to_string()),
+        source: ExecCommandSource::UnifiedExecStartup,
+        status: AppServerCommandExecutionStatus::Completed,
+        command_actions: Vec::new(),
+        aggregated_output: Some("test result: ok\n".to_string()),
+        exit_code: Some(0),
+        duration_ms: Some(5),
+    };
+    handle_exec_end(&mut chat, completed);
+
+    assert_no_submit_op(&mut op_rx);
+    assert_eq!(chat.queued_user_messages.len(), 1);
+    assert!(chat.unified_exec_processes.is_empty());
+}
+
+#[tokio::test]
+async fn replayed_completed_background_turn_before_active_turn_queues_wakeup() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.agent_turn_running = true;
+    chat.last_turn_id = Some("turn-active".to_string());
+    chat.unified_exec_processes.push(UnifiedExecProcessSummary {
+        key: "process-bg".to_string(),
+        process_id: Some("process-bg".to_string()),
+        call_id: "call-bg".to_string(),
+        command_display: "cargo test -p codex-tui".to_string(),
+        recent_chunks: Vec::new(),
+        turn_id: Some("turn-background".to_string()),
+        started_at: Instant::now(),
+        completion_wakeup_eligible: true,
+    });
+
+    let cwd = chat.config.cwd.clone();
+    let completed = AppServerThreadItem::CommandExecution {
+        id: "call-bg".to_string(),
+        command: "cargo test -p codex-tui".to_string(),
+        cwd,
+        process_id: Some("process-bg".to_string()),
+        source: ExecCommandSource::UnifiedExecStartup,
+        status: AppServerCommandExecutionStatus::Completed,
+        command_actions: Vec::new(),
+        aggregated_output: Some("test result: ok\n".to_string()),
+        exit_code: Some(0),
+        duration_ms: Some(5),
+    };
+    let mut background_turn = app_server_turn(
+        "turn-background",
+        AppServerTurnStatus::Completed,
+        /*duration_ms*/ None,
+        /*error*/ None,
+    );
+    background_turn.items.push(completed);
+
+    chat.replay_thread_turns(
+        vec![
+            background_turn,
+            app_server_turn(
+                "turn-active",
+                AppServerTurnStatus::InProgress,
+                /*duration_ms*/ None,
+                /*error*/ None,
+            ),
+        ],
+        ReplayKind::ThreadSnapshot,
+    );
+
+    assert_no_submit_op(&mut op_rx);
+    assert_eq!(chat.queued_user_messages.len(), 1);
+    assert!(chat.unified_exec_processes.is_empty());
+}
+
+#[tokio::test]
+async fn replayed_unified_exec_start_and_completion_do_not_queue_duplicate_wakeup() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    let command = vec!["bash".to_string(), "-lc".to_string(), "sleep 1".to_string()];
+    let begin = AppServerThreadItem::CommandExecution {
+        id: "call-bg".to_string(),
+        command: codex_shell_command::parse_command::shlex_join(&command),
+        cwd: chat.config.cwd.clone(),
+        process_id: Some("process-bg".to_string()),
+        source: ExecCommandSource::UnifiedExecStartup,
+        status: AppServerCommandExecutionStatus::InProgress,
+        command_actions: Vec::new(),
+        aggregated_output: None,
+        exit_code: None,
+        duration_ms: None,
+    };
+    chat.handle_thread_item(
+        begin,
+        "turn-1".to_string(),
+        ThreadItemRenderSource::Replay(ReplayKind::ThreadSnapshot),
+    );
+    assert_eq!(chat.unified_exec_processes.len(), 1);
+
+    let completed = AppServerThreadItem::CommandExecution {
+        id: "call-bg".to_string(),
+        command: codex_shell_command::parse_command::shlex_join(&command),
+        cwd: chat.config.cwd.clone(),
+        process_id: Some("process-bg".to_string()),
+        source: ExecCommandSource::UnifiedExecStartup,
+        status: AppServerCommandExecutionStatus::Completed,
+        command_actions: Vec::new(),
+        aggregated_output: Some("done\n".to_string()),
+        exit_code: Some(0),
+        duration_ms: Some(5),
+    };
+    chat.handle_thread_item(
+        completed,
+        "turn-1".to_string(),
+        ThreadItemRenderSource::Replay(ReplayKind::ThreadSnapshot),
+    );
+
+    assert!(chat.unified_exec_processes.is_empty());
+    assert!(chat.queued_user_messages.is_empty());
+    assert_no_submit_op(&mut op_rx);
+}
+
+#[tokio::test]
+async fn replayed_running_unified_exec_is_eligible_for_future_inactive_completion() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    let command = vec!["bash".to_string(), "-lc".to_string(), "sleep 1".to_string()];
+    let begin = AppServerThreadItem::CommandExecution {
+        id: "call-bg".to_string(),
+        command: codex_shell_command::parse_command::shlex_join(&command),
+        cwd: chat.config.cwd.clone(),
+        process_id: Some("process-bg".to_string()),
+        source: ExecCommandSource::UnifiedExecStartup,
+        status: AppServerCommandExecutionStatus::InProgress,
+        command_actions: Vec::new(),
+        aggregated_output: None,
+        exit_code: None,
+        duration_ms: None,
+    };
+    chat.handle_thread_item(
+        begin,
+        "turn-1".to_string(),
+        ThreadItemRenderSource::Replay(ReplayKind::ThreadSnapshot),
+    );
+    chat.mark_replayed_background_terminals_live();
+    let mut input_state = chat.capture_thread_input_state().unwrap();
+
+    let queued = input_state.queue_inactive_background_terminal_completion_wakeup(
+        "call-bg",
+        Some("process-bg"),
+        &AppServerCommandExecutionStatus::Completed,
+        Some(0),
+        "done\n",
+        Some("turn-1"),
+        None,
+    );
+
+    assert!(queued);
+    assert_eq!(input_state.queued_user_messages.len(), 1);
+}
+
+#[tokio::test]
+async fn inactive_thread_input_state_queues_background_completion_once() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    handle_turn_started(&mut chat, "turn-background");
+    begin_unified_exec_startup(&mut chat, "call-bg", "process-bg", "sleep 1");
+    let mut input_state = chat.capture_thread_input_state().unwrap();
+    input_state.mark_background_terminals_turn_completed("turn-background");
+
+    let queued = input_state.queue_inactive_background_terminal_completion_wakeup(
+        "call-bg",
+        Some("process-bg"),
+        &AppServerCommandExecutionStatus::Completed,
+        Some(0),
+        "done\n",
+        Some("turn-background"),
+        None,
+    );
+
+    assert!(queued);
+    assert!(input_state.unified_exec_processes.is_empty());
+    assert_eq!(input_state.queued_user_messages.len(), 1);
+    assert!(
+        input_state
+            .queued_user_messages
+            .front()
+            .is_some_and(
+                |queued| queued.user_message.text.contains("Command: sleep 1")
+                    && queued.user_message.text.contains("done")
+            )
+    );
+}
+
+#[tokio::test]
+async fn inactive_current_turn_background_completion_does_not_queue_wakeup() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    handle_turn_started(&mut chat, "turn-background");
+    begin_unified_exec_startup(&mut chat, "call-bg", "process-bg", "sleep 1");
+    let mut input_state = chat.capture_thread_input_state().unwrap();
+
+    let queued = input_state.queue_inactive_background_terminal_completion_wakeup(
+        "call-bg",
+        Some("process-bg"),
+        &AppServerCommandExecutionStatus::Completed,
+        Some(0),
+        "done\n",
+        Some("turn-background"),
+        Some("turn-background"),
+    );
+
+    assert!(queued);
+    assert!(input_state.unified_exec_processes.is_empty());
+    assert!(input_state.queued_user_messages.is_empty());
+}
+
+#[tokio::test]
+async fn replayed_unified_exec_completion_does_not_queue_wakeup() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    let begin = begin_unified_exec_startup(&mut chat, "call-bg", "process-bg", "sleep 1");
+    assert_eq!(chat.unified_exec_processes.len(), 1);
+    chat.mark_unified_exec_processes_turn_completed("turn-1");
+    let completed = match begin {
+        AppServerThreadItem::CommandExecution {
+            id,
+            command,
+            cwd,
+            process_id,
+            source,
+            command_actions,
+            ..
+        } => AppServerThreadItem::CommandExecution {
+            id,
+            command,
+            cwd,
+            process_id,
+            source,
+            status: AppServerCommandExecutionStatus::Completed,
+            command_actions,
+            aggregated_output: Some("done\n".to_string()),
+            exit_code: Some(0),
+            duration_ms: Some(5),
+        },
+        other => panic!("expected command execution item, got {other:?}"),
+    };
+
+    chat.handle_thread_item(
+        completed,
+        "turn-1".to_string(),
+        ThreadItemRenderSource::Replay(ReplayKind::ThreadSnapshot),
+    );
+
+    assert!(chat.unified_exec_processes.is_empty());
+    assert_no_submit_op(&mut op_rx);
+    assert!(chat.queued_user_messages.is_empty());
+}
+
+#[tokio::test]
+async fn replayed_current_turn_unified_exec_completion_does_not_queue_wakeup() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    handle_turn_started(&mut chat, "turn-active");
+    let begin = begin_unified_exec_startup(&mut chat, "call-bg", "process-bg", "sleep 1");
+    assert_eq!(chat.unified_exec_processes.len(), 1);
+    let completed = match begin {
+        AppServerThreadItem::CommandExecution {
+            id,
+            command,
+            cwd,
+            process_id,
+            source,
+            command_actions,
+            ..
+        } => AppServerThreadItem::CommandExecution {
+            id,
+            command,
+            cwd,
+            process_id,
+            source,
+            status: AppServerCommandExecutionStatus::Completed,
+            command_actions,
+            aggregated_output: Some("done\n".to_string()),
+            exit_code: Some(0),
+            duration_ms: Some(5),
+        },
+        other => panic!("expected command execution item, got {other:?}"),
+    };
+
+    chat.handle_thread_item(
+        completed,
+        "turn-active".to_string(),
+        ThreadItemRenderSource::Replay(ReplayKind::ThreadSnapshot),
+    );
+
+    assert!(chat.unified_exec_processes.is_empty());
+    assert!(chat.queued_user_messages.is_empty());
+    assert_no_submit_op(&mut op_rx);
+}
+
+#[tokio::test]
+async fn down_arrow_opens_background_terminal_picker() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.unified_exec_processes.push(UnifiedExecProcessSummary {
+        key: "process-1".to_string(),
+        process_id: Some("process-1".to_string()),
+        call_id: "call-1".to_string(),
+        command_display: "cargo test -p codex-tui".to_string(),
+        recent_chunks: vec!["running tests".to_string()],
+        turn_id: Some("turn-1".to_string()),
+        started_at: Instant::now(),
+        completion_wakeup_eligible: true,
+    });
+    chat.sync_unified_exec_footer();
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+
+    assert_matches!(rx.try_recv(), Ok(AppEvent::OpenActivityDashboard));
+    chat.open_activity_dashboard();
+    let rendered = render_bottom_popup(&chat, /*width*/ 72);
+    assert_chatwidget_snapshot!("background_terminal_picker", rendered);
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let mut opened_process_id = None;
+    while let Ok(event) = rx.try_recv() {
+        if let AppEvent::OpenBackgroundTerminalDetails { process_id, .. } = event {
+            opened_process_id = Some(process_id);
+            break;
+        }
+    }
+    assert_eq!(opened_process_id.as_deref(), Some("process-1"));
+
+    chat.open_background_terminal_details(chat.thread_id.unwrap(), "process-1".to_string());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let cells = drain_insert_history(&mut rx);
+    let combined = cells
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        combined.contains("cargo test -p codex-tui") && combined.contains("running tests"),
+        "expected selected background terminal details, got {combined:?}"
+    );
 }
 
 #[tokio::test]

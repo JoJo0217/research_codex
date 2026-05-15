@@ -131,6 +131,22 @@ pub(crate) enum AppEvent {
     OpenAgentPicker,
     /// Switch the active thread to the selected agent.
     SelectAgentThread(ThreadId),
+    /// Open the combined subagent/background activity dashboard.
+    OpenActivityDashboard,
+    /// Open details for one running background terminal.
+    OpenBackgroundTerminalDetails {
+        thread_id: ThreadId,
+        process_id: String,
+    },
+    /// Open details for one known subagent thread.
+    OpenSubagentActivityDetails {
+        thread_id: ThreadId,
+    },
+    /// Request termination of one running background terminal.
+    StopBackgroundTerminal {
+        thread_id: ThreadId,
+        process_id: String,
+    },
 
     /// Fork the current thread into a transient side conversation.
     StartSide {

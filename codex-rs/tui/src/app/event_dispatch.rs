@@ -1696,6 +1696,28 @@ impl App {
                 self.select_agent_thread_and_discard_side(tui, app_server, thread_id)
                     .await?;
             }
+            AppEvent::OpenActivityDashboard => {
+                self.sync_background_terminal_activity_summaries().await;
+                self.chat_widget.open_activity_dashboard();
+            }
+            AppEvent::OpenBackgroundTerminalDetails {
+                thread_id,
+                process_id,
+            } => {
+                self.sync_background_terminal_activity_summaries().await;
+                self.chat_widget
+                    .open_background_terminal_details(thread_id, process_id);
+            }
+            AppEvent::OpenSubagentActivityDetails { thread_id } => {
+                self.chat_widget.open_subagent_activity_details(thread_id);
+            }
+            AppEvent::StopBackgroundTerminal {
+                thread_id,
+                process_id,
+            } => {
+                self.stop_background_terminal(app_server, thread_id, process_id)
+                    .await?;
+            }
             AppEvent::StartSide {
                 parent_thread_id,
                 user_message,

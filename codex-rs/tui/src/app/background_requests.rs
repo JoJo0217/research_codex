@@ -467,6 +467,14 @@ impl App {
         thread_id: ThreadId,
         event: FeedbackThreadEvent,
     ) {
+        if self.thread_is_closed_or_marked_closed(thread_id).await {
+            tracing::debug!(
+                thread_id = %thread_id,
+                "ignoring feedback event for closed or discarded thread"
+            );
+            return;
+        }
+
         let (sender, store) = {
             let channel = self.ensure_thread_channel(thread_id);
             (channel.sender.clone(), Arc::clone(&channel.store))

@@ -527,7 +527,7 @@ async fn enqueue_primary_thread_session_replays_buffered_approval_after_attach()
 
     assert_eq!(
         app.pending_app_server_requests
-            .note_server_request(&approval_request),
+            .note_server_request(thread_id, &approval_request),
         None
     );
     app.enqueue_primary_thread_request(approval_request).await?;
@@ -624,7 +624,7 @@ async fn resolved_buffered_approval_does_not_become_actionable_after_drain() -> 
 
     assert_eq!(
         app.pending_app_server_requests
-            .note_server_request(&approval_request),
+            .note_server_request(thread_id, &approval_request),
         None
     );
     app.enqueue_thread_request(thread_id, approval_request)
@@ -1789,6 +1789,162 @@ async fn refresh_agent_picker_thread_liveness_prunes_closed_metadata_only_thread
 }
 
 #[tokio::test]
+async fn refresh_liveness_wakes_primary_for_closed_subagent_once() -> Result<()> {
+    let (mut app, mut app_event_rx, _op_rx) = Box::pin(make_test_app_with_channels()).await;
+    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
+        app.chat_widget.config_ref(),
+    ))
+    .await
+    .expect("embedded app server");
+
+    let primary_thread_id = ThreadId::new();
+    let primary_session = test_thread_session(primary_thread_id, test_path_buf("/tmp/main"));
+    app.primary_thread_id = Some(primary_thread_id);
+    app.active_thread_id = Some(primary_thread_id);
+    app.primary_session_configured = Some(primary_session.clone());
+    app.chat_widget
+        .handle_thread_session(primary_session.clone());
+    app.thread_event_channels.insert(
+        primary_thread_id,
+        ThreadEventChannel::new_with_session(
+            THREAD_EVENT_CHANNEL_CAPACITY,
+            primary_session,
+            Vec::new(),
+        ),
+    );
+
+    let subagent_thread_id = ThreadId::new();
+    app.thread_event_channels
+        .insert(subagent_thread_id, ThreadEventChannel::new(/*capacity*/ 1));
+    app.agent_navigation.upsert(
+        subagent_thread_id,
+        Some("Scout".to_string()),
+        Some("worker".to_string()),
+        /*is_closed*/ false,
+    );
+    while app_event_rx.try_recv().is_ok() {}
+
+    let is_available =
+        Box::pin(app.refresh_agent_picker_thread_liveness(&mut app_server, subagent_thread_id))
+            .await;
+
+    assert!(is_available);
+    assert_eq!(
+        app.agent_navigation
+            .get(&subagent_thread_id)
+            .map(|entry| entry.is_closed),
+        Some(true)
+    );
+    assert!(
+        app.thread_event_channels
+            .get(&subagent_thread_id)
+            .expect("subagent channel")
+            .store
+            .lock()
+            .await
+            .is_closed()
+    );
+    {
+        let store = app
+            .thread_event_channels
+            .get(&subagent_thread_id)
+            .expect("subagent channel")
+            .store
+            .clone();
+        let mut store = store.lock().await;
+        store.push_notification(turn_started_notification(
+            subagent_thread_id,
+            "late-turn-start",
+        ));
+        assert!(store.is_closed());
+    }
+
+    let mut wakeup_count = 0;
+    while let Ok(event) = app_event_rx.try_recv() {
+        match event {
+            AppEvent::SubmitThreadOp {
+                thread_id,
+                op: Op::UserTurn { items, .. },
+            } => {
+                assert_eq!(thread_id, primary_thread_id);
+                assert!(matches!(items.as_slice(), [UserInput::Text { text, .. }]
+                        if text.contains("Subagent completed") && text.contains("Scout")));
+                wakeup_count += 1;
+            }
+            AppEvent::CodexOp(Op::UserTurn { items, .. }) => {
+                assert!(matches!(items.as_slice(), [UserInput::Text { text, .. }]
+                        if text.contains("Subagent completed") && text.contains("Scout")));
+                wakeup_count += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(wakeup_count, 1);
+
+    app.enqueue_thread_notification(
+        subagent_thread_id,
+        thread_closed_notification(subagent_thread_id),
+    )
+    .await?;
+    while let Ok(event) = app_event_rx.try_recv() {
+        assert!(
+            !matches!(
+                event,
+                AppEvent::SubmitThreadOp { .. } | AppEvent::CodexOp(Op::UserTurn { .. })
+            ),
+            "later ThreadClosed should not duplicate the liveness wakeup"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn storing_closed_active_thread_discards_background_terminal_activity() {
+    let (mut app, _app_event_rx, _op_rx) = Box::pin(make_test_app_with_channels()).await;
+    let subagent_thread_id = ThreadId::new();
+    let subagent_session = test_thread_session(subagent_thread_id, test_path_buf("/tmp/subagent"));
+    app.chat_widget
+        .handle_thread_session(subagent_session.clone());
+    app.active_thread_id = Some(subagent_thread_id);
+    let mut channel = ThreadEventChannel::new_with_session(
+        THREAD_EVENT_CHANNEL_CAPACITY,
+        subagent_session,
+        Vec::new(),
+    );
+    app.active_thread_rx = channel.receiver.take();
+    let store = channel.store.clone();
+    app.thread_event_channels
+        .insert(subagent_thread_id, channel);
+
+    app.chat_widget.handle_server_notification(
+        turn_started_notification(subagent_thread_id, "turn-1"),
+        /*replay_kind*/ None,
+    );
+    app.chat_widget.handle_server_notification(
+        unified_exec_started_notification(subagent_thread_id, "turn-1", "call-bg", "proc-bg"),
+        /*replay_kind*/ None,
+    );
+    assert_eq!(
+        app.chat_widget
+            .current_background_terminal_activity_summaries(subagent_thread_id)
+            .len(),
+        1
+    );
+
+    store.lock().await.mark_closed_for_liveness();
+    app.store_active_thread_receiver().await;
+
+    let guard = store.lock().await;
+    assert!(guard.is_closed());
+    assert!(guard.input_state.as_ref().is_none_or(|state| {
+        state
+            .background_terminal_activity_summaries(subagent_thread_id)
+            .is_empty()
+    }));
+}
+
+#[tokio::test]
 async fn open_agent_picker_prompts_to_enable_multi_agent_when_disabled() -> Result<()> {
     let (mut app, mut app_event_rx, _op_rx) = Box::pin(make_test_app_with_channels()).await;
     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
@@ -2591,6 +2747,87 @@ async fn inactive_thread_approval_bubbles_into_active_view() -> Result<()> {
 }
 
 #[tokio::test]
+async fn closed_thread_late_approval_is_not_surfaced() -> Result<()> {
+    let mut app = make_test_app().await;
+    let main_thread_id =
+        ThreadId::from_string("00000000-0000-0000-0000-000000000011").expect("valid thread");
+    let agent_thread_id =
+        ThreadId::from_string("00000000-0000-0000-0000-000000000022").expect("valid thread");
+
+    app.primary_thread_id = Some(main_thread_id);
+    app.active_thread_id = Some(main_thread_id);
+    app.thread_event_channels
+        .insert(main_thread_id, ThreadEventChannel::new(/*capacity*/ 1));
+    let agent_channel = ThreadEventChannel::new_with_session(
+        /*capacity*/ 4,
+        ThreadSessionState {
+            approval_policy: AskForApproval::OnRequest,
+            permission_profile: PermissionProfile::workspace_write(),
+            rollout_path: Some(test_path_buf("/tmp/agent-rollout.jsonl")),
+            ..test_thread_session(agent_thread_id, test_path_buf("/tmp/agent"))
+        },
+        Vec::new(),
+    );
+    {
+        let mut store = agent_channel.store.lock().await;
+        store.mark_closed_for_liveness();
+    }
+    app.thread_event_channels
+        .insert(agent_thread_id, agent_channel);
+    app.agent_navigation.upsert(
+        agent_thread_id,
+        Some("Robie".to_string()),
+        Some("explorer".to_string()),
+        /*is_closed*/ true,
+    );
+
+    let request = exec_approval_request(
+        agent_thread_id,
+        "turn-approval",
+        "call-approval",
+        /*approval_id*/ None,
+    );
+    assert_eq!(
+        app.pending_app_server_requests
+            .note_server_request(agent_thread_id, &request),
+        None
+    );
+
+    let result = app
+        .enqueue_thread_request(agent_thread_id, request.clone())
+        .await?;
+
+    assert_eq!(
+        result,
+        super::thread_routing::ThreadRequestEnqueueResult::ThreadClosed
+    );
+    app.pending_app_server_requests
+        .discard_server_request(request.id());
+    app.refresh_pending_thread_approvals().await;
+    assert!(
+        !app.pending_app_server_requests
+            .contains_server_request(&request)
+    );
+    assert!(app.chat_widget.pending_thread_approvals().is_empty());
+    let store = app
+        .thread_event_channels
+        .get(&agent_thread_id)
+        .expect("agent channel")
+        .store
+        .lock()
+        .await;
+    assert!(store.pending_replay_requests().is_empty());
+    assert!(
+        store
+            .buffer
+            .iter()
+            .all(|event| !matches!(event, ThreadBufferedEvent::Request(_)))
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn side_defers_parent_approval_overlay_until_parent_replay() -> Result<()> {
     let mut app = make_test_app().await;
     let parent_thread_id =
@@ -2644,6 +2881,160 @@ async fn side_defers_parent_approval_overlay_until_parent_replay() -> Result<()>
     app.replay_thread_snapshot(snapshot, /*resume_restored_queue*/ false);
 
     assert_eq!(app.chat_widget.has_active_view(), true);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn discarded_side_thread_late_close_does_not_wake_primary() -> Result<()> {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let primary_thread_id = ThreadId::new();
+    let side_thread_id = ThreadId::new();
+
+    app.primary_thread_id = Some(primary_thread_id);
+    app.active_thread_id = Some(primary_thread_id);
+    app.thread_event_channels
+        .insert(primary_thread_id, ThreadEventChannel::new(/*capacity*/ 4));
+    app.thread_event_channels.insert(
+        side_thread_id,
+        ThreadEventChannel::new_with_session(
+            /*capacity*/ 4,
+            test_thread_session(side_thread_id, test_path_buf("/tmp/side")),
+            Vec::new(),
+        ),
+    );
+    app.side_threads
+        .insert(side_thread_id, SideThreadState::new(primary_thread_id));
+    app.agent_navigation.upsert(
+        side_thread_id,
+        Some("Side".to_string()),
+        Some("side".to_string()),
+        /*is_closed*/ false,
+    );
+
+    app.discard_closed_side_thread(side_thread_id).await;
+    app.enqueue_thread_notification(side_thread_id, thread_closed_notification(side_thread_id))
+        .await?;
+
+    assert!(!app.thread_event_channels.contains_key(&side_thread_id));
+    assert!(app.agent_navigation.get(&side_thread_id).is_none());
+    let late_request = exec_approval_request(
+        side_thread_id,
+        "turn-late",
+        "call-late",
+        /*approval_id*/ None,
+    );
+    assert_eq!(
+        app.enqueue_thread_request(side_thread_id, late_request)
+            .await?,
+        super::thread_routing::ThreadRequestEnqueueResult::ThreadClosed
+    );
+    assert!(!app.thread_event_channels.contains_key(&side_thread_id));
+    app.refresh_pending_thread_approvals().await;
+    assert!(app.chat_widget.pending_thread_approvals().is_empty());
+    while let Ok(event) = app_event_rx.try_recv() {
+        assert!(
+            !matches!(
+                event,
+                AppEvent::SubmitThreadOp {
+                    op: Op::UserTurn { .. },
+                    ..
+                } | AppEvent::CodexOp(Op::UserTurn { .. })
+            ),
+            "discarded side thread must not wake the primary"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn clean_background_terminals_prunes_active_store_replay_buffer() {
+    let mut app = make_test_app().await;
+    let thread_id = ThreadId::new();
+    let started = unified_exec_started_notification(thread_id, "turn-1", "call-bg", "proc-bg");
+    let output = ServerNotification::CommandExecutionOutputDelta(
+        codex_app_server_protocol::CommandExecutionOutputDeltaNotification {
+            thread_id: thread_id.to_string(),
+            turn_id: "turn-1".to_string(),
+            item_id: "call-bg".to_string(),
+            delta: "running".to_string(),
+        },
+    );
+    let channel = ThreadEventChannel::new_with_session(
+        /*capacity*/ 8,
+        test_thread_session(thread_id, test_path_buf("/tmp/project")),
+        Vec::new(),
+    );
+    {
+        let mut store = channel.store.lock().await;
+        store.push_notification(started.clone());
+        store.push_notification(output.clone());
+    }
+    app.active_thread_id = Some(thread_id);
+    app.thread_event_channels.insert(thread_id, channel);
+
+    app.mark_active_background_terminals_stopped().await;
+
+    assert!(
+        app.should_drop_stopped_background_terminal_event(&ThreadBufferedEvent::Notification(
+            started
+        ))
+        .await
+    );
+    assert!(
+        app.should_drop_stopped_background_terminal_event(&ThreadBufferedEvent::Notification(
+            output
+        ))
+        .await
+    );
+    let store = app
+        .thread_event_channels
+        .get(&thread_id)
+        .expect("thread channel")
+        .store
+        .clone();
+    let mut store = store.lock().await;
+    assert!(store.snapshot().events.is_empty());
+    let late_completion = store.track_inactive_background_terminal_notification(
+        &unified_exec_completed_notification(thread_id, "turn-1", "call-bg", "proc-bg"),
+    );
+    assert!(late_completion.drop_notification);
+}
+
+#[tokio::test]
+async fn closed_parent_late_turn_started_does_not_clear_side_status() -> Result<()> {
+    let mut app = make_test_app().await;
+    let parent_thread_id = ThreadId::new();
+    let side_thread_id = ThreadId::new();
+    let parent_channel = ThreadEventChannel::new_with_session(
+        /*capacity*/ 8,
+        test_thread_session(parent_thread_id, test_path_buf("/tmp/parent")),
+        Vec::new(),
+    );
+    {
+        let mut store = parent_channel.store.lock().await;
+        store.mark_closed_for_liveness();
+    }
+    app.thread_event_channels
+        .insert(parent_thread_id, parent_channel);
+    app.active_thread_id = Some(side_thread_id);
+    let mut side_state = SideThreadState::new(parent_thread_id);
+    side_state.parent_status = Some(SideParentStatus::NeedsApproval);
+    app.side_threads.insert(side_thread_id, side_state);
+
+    app.enqueue_thread_notification(
+        parent_thread_id,
+        turn_started_notification(parent_thread_id, "late-turn"),
+    )
+    .await?;
+
+    assert_eq!(
+        app.side_threads
+            .get(&side_thread_id)
+            .and_then(|state| state.parent_status),
+        Some(SideParentStatus::NeedsApproval)
+    );
 
     Ok(())
 }
@@ -4144,12 +4535,14 @@ async fn make_test_app() -> App {
         thread_event_listener_tasks: HashMap::new(),
         agent_navigation: AgentNavigationState::default(),
         side_threads: HashMap::new(),
+        discarded_side_thread_ids: HashSet::new(),
         active_thread_id: None,
         active_thread_rx: None,
         primary_thread_id: None,
         last_subagent_backfill_attempt: None,
         primary_session_configured: None,
         pending_primary_events: VecDeque::new(),
+        pending_subagent_completion_wakeups: VecDeque::new(),
         pending_app_server_requests: PendingAppServerRequests::default(),
         pending_plugin_enabled_writes: HashMap::new(),
         pending_hook_enabled_writes: HashMap::new(),
@@ -4212,12 +4605,14 @@ async fn make_test_app_with_channels() -> (
             thread_event_listener_tasks: HashMap::new(),
             agent_navigation: AgentNavigationState::default(),
             side_threads: HashMap::new(),
+            discarded_side_thread_ids: HashSet::new(),
             active_thread_id: None,
             active_thread_rx: None,
             primary_thread_id: None,
             last_subagent_backfill_attempt: None,
             primary_session_configured: None,
             pending_primary_events: VecDeque::new(),
+            pending_subagent_completion_wakeups: VecDeque::new(),
             pending_app_server_requests: PendingAppServerRequests::default(),
             pending_plugin_enabled_writes: HashMap::new(),
             pending_hook_enabled_writes: HashMap::new(),
@@ -4452,6 +4847,55 @@ fn turn_completed_notification(
             completed_at: Some(0),
             duration_ms: Some(1),
             ..test_turn(turn_id, status, Vec::new())
+        },
+    })
+}
+
+fn unified_exec_started_notification(
+    thread_id: ThreadId,
+    turn_id: &str,
+    call_id: &str,
+    process_id: &str,
+) -> ServerNotification {
+    ServerNotification::ItemStarted(ItemStartedNotification {
+        thread_id: thread_id.to_string(),
+        turn_id: turn_id.to_string(),
+        started_at_ms: 0,
+        item: ThreadItem::CommandExecution {
+            id: call_id.to_string(),
+            command: "bash -lc 'sleep 1'".to_string(),
+            cwd: test_path_buf("/tmp/project").abs(),
+            process_id: Some(process_id.to_string()),
+            source: codex_app_server_protocol::CommandExecutionSource::UnifiedExecStartup,
+            status: codex_app_server_protocol::CommandExecutionStatus::InProgress,
+            command_actions: Vec::new(),
+            aggregated_output: None,
+            exit_code: None,
+            duration_ms: None,
+        },
+    })
+}
+
+fn unified_exec_completed_notification(
+    thread_id: ThreadId,
+    turn_id: &str,
+    call_id: &str,
+    process_id: &str,
+) -> ServerNotification {
+    ServerNotification::ItemCompleted(ItemCompletedNotification {
+        thread_id: thread_id.to_string(),
+        turn_id: turn_id.to_string(),
+        item: ThreadItem::CommandExecution {
+            id: call_id.to_string(),
+            command: "bash -lc 'sleep 1'".to_string(),
+            cwd: test_path_buf("/tmp/project").abs(),
+            process_id: Some(process_id.to_string()),
+            source: codex_app_server_protocol::CommandExecutionSource::UnifiedExecStartup,
+            status: codex_app_server_protocol::CommandExecutionStatus::Completed,
+            command_actions: Vec::new(),
+            aggregated_output: Some("done\n".to_string()),
+            exit_code: Some(0),
+            duration_ms: Some(5),
         },
     })
 }

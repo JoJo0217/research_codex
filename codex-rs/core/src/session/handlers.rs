@@ -71,6 +71,12 @@ pub async fn clean_background_terminals(sess: &Arc<Session>) {
     sess.close_unified_exec_processes().await;
 }
 
+pub async fn terminate_background_terminal(sess: &Arc<Session>, process_id: i32) {
+    if !sess.close_unified_exec_process(process_id).await {
+        warn!(process_id, "background terminal process not found");
+    }
+}
+
 pub async fn realtime_conversation_list_voices(sess: &Session, sub_id: String) {
     sess.send_event_raw(Event {
         id: sub_id,
@@ -725,6 +731,10 @@ pub(super) async fn submission_loop(
                 }
                 Op::CleanBackgroundTerminals => {
                     clean_background_terminals(&sess).await;
+                    false
+                }
+                Op::TerminateBackgroundTerminal { process_id } => {
+                    terminate_background_terminal(&sess, process_id).await;
                     false
                 }
                 Op::RealtimeConversationStart(params) => {

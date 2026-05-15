@@ -246,6 +246,8 @@ pub(super) async fn make_chatwidget_manual(
         turn_sleep_inhibitor: SleepInhibitor::new(prevent_idle_sleep),
         task_complete_pending: false,
         unified_exec_processes: Vec::new(),
+        background_terminal_activity_summaries: Vec::new(),
+        subagent_activity_summaries: Vec::new(),
         agent_turn_running: false,
         mcp_startup_status: None,
         mcp_startup_expected_servers: None,

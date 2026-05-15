@@ -2749,6 +2749,20 @@ impl HistoryCell for ContextCompactionSummaryCell {
         lines.extend(prefix_lines(body, "  ".into(), "  ".into()));
         lines
     }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        let mut lines = vec![Line::from("Context compacted")];
+        if let Some(summary) = self
+            .summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            lines.push(Line::from(""));
+            lines.extend(raw_lines_from_source(summary));
+        }
+        lines
+    }
 }
 
 pub(crate) fn new_error_event(message: String) -> PlainHistoryCell {

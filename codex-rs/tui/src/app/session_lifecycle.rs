@@ -128,9 +128,10 @@ impl App {
     ///
     /// Closing a thread is not the same as removing it: users can still inspect finished agent
     /// transcripts, and the stable next/previous traversal order should not collapse around them.
-    pub(super) fn mark_agent_picker_thread_closed(&mut self, thread_id: ThreadId) {
-        self.agent_navigation.mark_closed(thread_id);
+    pub(super) fn mark_agent_picker_thread_closed(&mut self, thread_id: ThreadId) -> bool {
+        let changed = self.agent_navigation.mark_closed(thread_id);
         self.sync_active_agent_label();
+        changed
     }
 
     pub(super) async fn refresh_agent_picker_thread_liveness(
@@ -145,6 +146,15 @@ impl App {
             .await
         {
             Ok(thread) => {
+                let is_closed = matches!(
+                    thread.status,
+                    codex_app_server_protocol::ThreadStatus::NotLoaded
+                );
+                let closed_transition = is_closed
+                    && existing_entry
+                        .as_ref()
+                        .is_some_and(|entry| !entry.is_closed)
+                    && has_replay_channel;
                 self.upsert_agent_picker_thread(
                     thread_id,
                     thread.agent_nickname.or_else(|| {
@@ -157,16 +167,21 @@ impl App {
                             .as_ref()
                             .and_then(|entry| entry.agent_role.clone())
                     }),
-                    matches!(
-                        thread.status,
-                        codex_app_server_protocol::ThreadStatus::NotLoaded
-                    ),
+                    is_closed,
                 );
+                if is_closed && has_replay_channel {
+                    self.mark_thread_store_closed_for_liveness(thread_id).await;
+                }
+                if closed_transition {
+                    self.wake_primary_for_closed_subagent_transition(thread_id, true)
+                        .await;
+                }
                 true
             }
             Err(err) => {
                 if Self::is_terminal_thread_read_error(&err) && !has_replay_channel {
                     self.agent_navigation.remove(thread_id);
+                    self.sync_active_agent_label();
                     return false;
                 }
                 let is_closed = Self::closed_state_for_thread_read_error(
@@ -174,17 +189,28 @@ impl App {
                     existing_entry.as_ref().map(|entry| entry.is_closed),
                 );
                 if let Some(entry) = existing_entry {
+                    let was_open = !entry.is_closed;
                     self.upsert_agent_picker_thread(
                         thread_id,
                         entry.agent_nickname,
                         entry.agent_role,
                         is_closed,
                     );
+                    if is_closed && has_replay_channel {
+                        self.mark_thread_store_closed_for_liveness(thread_id).await;
+                    }
+                    if is_closed && was_open && has_replay_channel {
+                        self.wake_primary_for_closed_subagent_transition(thread_id, true)
+                            .await;
+                    }
                 } else {
                     self.upsert_agent_picker_thread(
                         thread_id, /*agent_nickname*/ None, /*agent_role*/ None,
                         is_closed,
                     );
+                    if is_closed && has_replay_channel {
+                        self.mark_thread_store_closed_for_liveness(thread_id).await;
+                    }
                 }
                 true
             }
@@ -285,8 +311,25 @@ impl App {
         app_server: &mut AppServerSession,
         thread_id: ThreadId,
     ) -> Result<()> {
+        if self
+            .select_agent_thread_without_drain(tui, app_server, thread_id)
+            .await?
+        {
+            self.drain_active_thread_events(tui, app_server).await?;
+            self.sync_background_terminal_activity_summaries().await;
+            self.refresh_pending_thread_approvals().await;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn select_agent_thread_without_drain(
+        &mut self,
+        tui: &mut tui::Tui,
+        app_server: &mut AppServerSession,
+        thread_id: ThreadId,
+    ) -> Result<bool> {
         if self.active_thread_id == Some(thread_id) {
-            return Ok(());
+            return Ok(false);
         }
 
         if !self
@@ -295,7 +338,7 @@ impl App {
         {
             self.chat_widget
                 .add_error_message(format!("Agent thread {thread_id} is no longer available."));
-            return Ok(());
+            return Ok(false);
         }
 
         let mut is_replay_only = self
@@ -318,13 +361,13 @@ impl App {
                     self.chat_widget.add_error_message(format!(
                         "Failed to attach to agent thread {thread_id}: {err}"
                     ));
-                    return Ok(());
+                    return Ok(false);
                 }
             }
         } else if !self.thread_event_channels.contains_key(&thread_id) && is_replay_only {
             self.chat_widget
                 .add_error_message(format!("Agent thread {thread_id} is no longer available."));
-            return Ok(());
+            return Ok(false);
         }
 
         let previous_thread_id = self.active_thread_id;
@@ -337,7 +380,7 @@ impl App {
             if let Some(previous_thread_id) = previous_thread_id {
                 self.activate_thread_channel(previous_thread_id).await;
             }
-            return Ok(());
+            return Ok(false);
         };
 
         self.refresh_snapshot_session_if_needed(
@@ -360,6 +403,10 @@ impl App {
 
         self.reset_for_thread_switch(tui)?;
         self.replay_thread_snapshot(snapshot, !is_replay_only);
+        self.sync_background_terminal_activity_summaries().await;
+        if self.primary_thread_id == Some(thread_id) {
+            self.flush_pending_subagent_completion_wakeups();
+        }
         if is_replay_only {
             let message = if attached_replay_only {
                 format!(
@@ -370,10 +417,7 @@ impl App {
             };
             self.chat_widget.add_info_message(message, /*hint*/ None);
         }
-        self.drain_active_thread_events(tui).await?;
-        self.refresh_pending_thread_approvals().await;
-
-        Ok(())
+        Ok(true)
     }
 
     pub(super) fn should_attach_live_thread_for_selection(&self, thread_id: ThreadId) -> bool {
@@ -411,14 +455,18 @@ impl App {
         self.thread_event_channels.clear();
         self.agent_navigation.clear();
         self.side_threads.clear();
+        self.discarded_side_thread_ids.clear();
         self.active_thread_id = None;
         self.active_thread_rx = None;
         self.primary_thread_id = None;
         self.last_subagent_backfill_attempt = None;
         self.primary_session_configured = None;
         self.pending_primary_events.clear();
+        self.pending_subagent_completion_wakeups.clear();
         self.pending_app_server_requests.clear();
         self.chat_widget.set_pending_thread_approvals(Vec::new());
+        self.chat_widget
+            .set_background_terminal_activity_summaries(Vec::new());
         self.sync_active_agent_label();
     }
 

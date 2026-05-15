@@ -75,6 +75,7 @@ pub(crate) struct UnifiedExecProcess {
     process_handle: ProcessHandle,
     output_tx: broadcast::Sender<Vec<u8>>,
     output_buffer: OutputBuffer,
+    transcript_buffer: OutputBuffer,
     output_notify: Arc<Notify>,
     output_closed: Arc<AtomicBool>,
     output_closed_notify: Arc<Notify>,
@@ -104,6 +105,7 @@ impl UnifiedExecProcess {
         spawn_lifecycle: Option<SpawnLifecycleHandle>,
     ) -> Self {
         let output_buffer = Arc::new(Mutex::new(HeadTailBuffer::default()));
+        let transcript_buffer = Arc::new(Mutex::new(HeadTailBuffer::default()));
         let output_notify = Arc::new(Notify::new());
         let output_closed = Arc::new(AtomicBool::new(false));
         let output_closed_notify = Arc::new(Notify::new());
@@ -116,6 +118,7 @@ impl UnifiedExecProcess {
             process_handle,
             output_tx,
             output_buffer,
+            transcript_buffer,
             output_notify,
             output_closed,
             output_closed_notify,
@@ -162,6 +165,10 @@ impl UnifiedExecProcess {
             output_closed_notify: Arc::clone(&self.output_closed_notify),
             cancellation_token: self.cancellation_token.clone(),
         }
+    }
+
+    pub(super) fn transcript_buffer(&self) -> OutputBuffer {
+        Arc::clone(&self.transcript_buffer)
     }
 
     pub(super) fn output_receiver(&self) -> tokio::sync::broadcast::Receiver<Vec<u8>> {
@@ -300,6 +307,7 @@ impl UnifiedExecProcess {
         managed.output_task = Some(Self::spawn_local_output_task(
             output_rx,
             Arc::clone(&managed.output_buffer),
+            Arc::clone(&managed.transcript_buffer),
             Arc::clone(&managed.output_notify),
             Arc::clone(&managed.output_closed),
             Arc::clone(&managed.output_closed_notify),
@@ -350,6 +358,7 @@ impl UnifiedExecProcess {
         managed.output_task = Some(Self::spawn_exec_server_output_task(
             started,
             output_handles,
+            Arc::clone(&managed.transcript_buffer),
             managed.output_tx.clone(),
             managed.state_tx.clone(),
         ));
@@ -378,6 +387,7 @@ impl UnifiedExecProcess {
     fn spawn_exec_server_output_task(
         started: StartedExecProcess,
         output_handles: OutputHandles,
+        transcript_buffer: OutputBuffer,
         output_tx: broadcast::Sender<Vec<u8>>,
         state_tx: watch::Sender<ProcessState>,
     ) -> JoinHandle<()> {
@@ -409,10 +419,13 @@ impl UnifiedExecProcess {
 
                         for chunk in chunks {
                             let bytes = chunk.chunk.into_inner();
+                            let mut transcript_guard = transcript_buffer.lock().await;
+                            transcript_guard.push_chunk(bytes.clone());
+                            drop(transcript_guard);
                             let mut guard = output_buffer.lock().await;
                             guard.push_chunk(bytes.clone());
-                            drop(guard);
                             let _ = output_tx.send(bytes);
+                            drop(guard);
                             output_notify.notify_waiters();
                         }
 
@@ -467,6 +480,7 @@ impl UnifiedExecProcess {
     fn spawn_local_output_task(
         mut receiver: tokio::sync::broadcast::Receiver<Vec<u8>>,
         buffer: OutputBuffer,
+        transcript_buffer: OutputBuffer,
         output_notify: Arc<Notify>,
         output_closed: Arc<AtomicBool>,
         output_closed_notify: Arc<Notify>,
@@ -476,10 +490,13 @@ impl UnifiedExecProcess {
             loop {
                 match receiver.recv().await {
                     Ok(chunk) => {
+                        let mut transcript_guard = transcript_buffer.lock().await;
+                        transcript_guard.push_chunk(chunk.clone());
+                        drop(transcript_guard);
                         let mut guard = buffer.lock().await;
                         guard.push_chunk(chunk.clone());
-                        drop(guard);
                         let _ = output_tx.send(chunk);
+                        drop(guard);
                         output_notify.notify_waiters();
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,

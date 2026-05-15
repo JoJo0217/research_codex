@@ -1154,6 +1154,14 @@ impl BottomPane {
         }
     }
 
+    /// Update the active subagent count shown in the shared activity footer.
+    pub(crate) fn set_active_subagent_count(&mut self, count: usize) {
+        if self.unified_exec_footer.set_active_subagent_count(count) {
+            self.sync_status_inline_message();
+            self.request_redraw();
+        }
+    }
+
     /// Copy unified-exec summary text into the active status row, if any.
     ///
     /// This keeps status-line inline text synchronized without forcing the
@@ -2258,7 +2266,7 @@ mod tests {
 
         let area = Rect::new(0, 0, width, after);
         let rendered = render_snapshot(&pane, area);
-        assert!(rendered.contains("background terminal running · /ps to view"));
+        assert!(rendered.contains("background terminal running · ↓ to manage"));
     }
 
     #[test]

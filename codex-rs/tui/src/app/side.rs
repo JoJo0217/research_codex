@@ -370,6 +370,7 @@ impl App {
         self.thread_event_channels.remove(&thread_id);
         self.side_threads.remove(&thread_id);
         self.agent_navigation.remove(thread_id);
+        self.discarded_side_thread_ids.insert(thread_id);
         if self.active_thread_id == Some(thread_id) {
             self.clear_active_thread().await;
         } else {
@@ -401,7 +402,9 @@ impl App {
         thread_id: ThreadId,
     ) {
         if self.active_thread_id != Some(thread_id)
-            && let Err(err) = self.select_agent_thread(tui, app_server, thread_id).await
+            && let Err(err) = self
+                .select_agent_thread_without_drain(tui, app_server, thread_id)
+                .await
         {
             tracing::warn!(
                 "failed to restore side conversation after cleanup failure for {thread_id}: {err}"
@@ -505,6 +508,34 @@ impl App {
         let active_thread_id_before_switch = self.active_thread_id;
         let side_thread_to_discard = self.side_thread_to_discard_after_switch(thread_id);
         self.select_agent_thread(tui, app_server, thread_id).await?;
+        if self.active_thread_id == Some(thread_id)
+            && let Some(side_thread_id) = side_thread_to_discard
+        {
+            if self.discard_side_thread(app_server, side_thread_id).await {
+                self.surface_pending_inactive_thread_interactive_requests()
+                    .await;
+            } else if active_thread_id_before_switch == Some(side_thread_id) {
+                self.keep_side_thread_visible_after_cleanup_failure(
+                    tui,
+                    app_server,
+                    side_thread_id,
+                )
+                .await;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) async fn select_agent_thread_and_discard_side_without_drain(
+        &mut self,
+        tui: &mut tui::Tui,
+        app_server: &mut AppServerSession,
+        thread_id: ThreadId,
+    ) -> Result<()> {
+        let active_thread_id_before_switch = self.active_thread_id;
+        let side_thread_to_discard = self.side_thread_to_discard_after_switch(thread_id);
+        self.select_agent_thread_without_drain(tui, app_server, thread_id)
+            .await?;
         if self.active_thread_id == Some(thread_id)
             && let Some(side_thread_id) = side_thread_to_discard
         {
